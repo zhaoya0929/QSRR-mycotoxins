@@ -1,0 +1,2982 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# ========================= Quick Config =========================
+INHOUSE_PATH   = r""
+THEORY_PATH    = r""
+OUTDIR         = r""
+
+# Optional: user anchors (csv/txt; csv may contain compound_name, ion_mode)
+ANCHORS_USER   = r""
+
+# —— Calibration scope ——
+CALIBRATION_SCOPE       = "per_mode"   # "per_mode" | "global"
+CHOSEN_SPACE_GLOBAL     = "auto"       # "auto" | "rt" | "k"
+PRINT_PER_MODE_METRICS  = 1
+
+# —— Stability & model knobs ——
+K_COVERAGE_THRESH       = 0.8
+CORR_FILTER_TOPN        = 100
+USE_KRR                 = 1
+ROBUST_C                = 3.8
+USE_STACKING            = 1
+
+SPEARMAN_CUTOFF_POS     = 0.60
+SPEARMAN_CUTOFF_NEG     = 0.70
+ANCHORS_N_POS           = 50
+ANCHORS_N_NEG           = 24
+ANCHORS_MAX_FRAC        = 0.25
+ANCHORS_MIN_GAP         = 0.20
+MIN_GAP_POS             = 0.12
+MIN_GAP_NEG             = 0.20
+
+# —— per-adduct secondary calibration ——
+MIN_GROUP_N             = 4
+
+# —— Fingerprint (optional; OFF by default) ——
+USE_FP                  = 0
+FP_BITS                 = 2048
+FP_RADIUS               = 2
+FP_SVD                  = 48
+
+SEED                    = 42
+
+
+USE_RD_1D2D             = 1
+USE_RD_3D               = 1
+USE_3D_MMFF_OPT         = 1
+EMBED_MAXITERS          = 200
+MAX_3D_FAIL_RATIO       = 0.30
+
+# ================== Runtime & Validation Add-ons =================
+FREEZE_SCHEMA = 1
+SPEED_PROFILE           = "exact"
+N_JOBS                  = 1
+USE_3D_CACHE            = 1
+CACHE_MAX_ROWS_IN_MEM   = 200000
+
+RUN_VALIDATION          = 1
+RUN_SCRAMBLE            = 30
+EXTERNAL_LIST           = r"E:\mycotoxins\QSRR\external.csv"
+
+# ================== Plotting & Analysis Add-ons ==================
+MAKE_PLOTS             = 1
+PLOTS_DPI              = 220
+PLOTS_FMT              = "png"
+
+MAKE_LEARNING_CURVE    = 0
+LC_POINTS              = [0.2, 0.4, 0.6, 0.8, 1.0]
+LC_SEED                = 42
+
+MAKE_ABLATION          = 0
+
+# ===== Deterministic setup: must be BEFORE importing numpy/sklearn =====
+import os, random
+os.environ["PYTHONHASHSEED"] = "0"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+random.seed(42)
+
+# =================================================================
+import os, sys, json, re, warnings, time, hashlib
+import pickle
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from typing import List, Dict, Any, Optional, Tuple
+import numpy as np
+import pandas as pd
+from datetime import datetime
+np.random.seed(SEED)
+
+np.seterr(divide="ignore", invalid="ignore")
+warnings.filterwarnings("ignore", category=UserWarning)
+
+from sklearn.model_selection import KFold
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor
+from sklearn.isotonic import IsotonicRegression
+from sklearn.decomposition import TruncatedSVD
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.linear_model import Ridge, LinearRegression
+
+# ---------- RDKit ----------
+HAS_RDKIT=False
+try:
+    from rdkit import Chem, DataStructs, RDLogger
+    from rdkit.Chem import Descriptors as RDDesc
+    from rdkit.Chem import rdMolDescriptors as RDMD
+    from rdkit.Chem import AllChem
+    RDLogger.DisableLog('rdApp.error'); RDLogger.DisableLog('rdApp.warning')
+    HAS_RDKIT=True
+except Exception:
+    HAS_RDKIT=False
+
+# ---------------------- Small utilities --------------------------
+def tic(msg=""):
+    return time.time(), msg
+
+def toc(t0, msg=""):
+    dt = time.time() - t0
+    if msg: print(f"[TIME] {msg}: {dt:.2f}s")
+    return dt
+
+def makedirs(p):
+    os.makedirs(p, exist_ok=True); return p
+
+def read_csv_any(path: str) -> pd.DataFrame:
+    last = None
+    for enc in ("utf-8","utf-8-sig","gbk","latin1"):
+        try: return pd.read_csv(path, encoding=enc, low_memory=False)
+        except Exception as e: last=str(e)
+    raise RuntimeError(f"Failed to read CSV: {path}\nLast error: {last}")
+
+def safe_to_csv(df: pd.DataFrame, path: str, **kwargs):
+    try:
+        df.to_csv(path, **kwargs); return
+    except PermissionError:
+        base, ext = os.path.splitext(path)
+        tmp = f"{base}.tmp_{os.getpid()}{ext}"
+        df.to_csv(tmp, **kwargs)
+        try:
+            os.replace(tmp, path); return
+        except PermissionError:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            alt = f"{base}_{ts}{ext}"
+            try: os.replace(tmp, alt)
+            except Exception: df.to_csv(alt, **kwargs)
+            print(f"[WARN] '{path}' is in use; wrote backup to: {alt}")
+
+
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    def norm(c):
+        c = str(c).strip().lower()
+        c = re.sub(r"[^\w]+","_", c)
+        c = re.sub(r"_+","_", c).strip("_")
+        return c
+    out = df.copy()
+    out.columns = [norm(c) for c in df.columns]
+    return out
+
+def unify_mode(s) -> str:
+    if pd.isna(s): return "UNK"
+    s2 = str(s).strip().upper().replace(" ","")
+    if s2 in {"POS","+","POSITIVE","POSITIVEION","ESI+","APCI+","APPI+","PCI"}: return "POS"
+    if s2 in {"NEG","-","NEGATIVE","NEGATIVEION","ESI-","APCI-","APPI-","NCI"}: return "NEG"
+    return s2
+
+ADDUCT_MAP = {"[m+h]+":"H","[m+na]+":"Na","[m+nh4]+":"NH4","[m+k]+":"K",
+              "[m-h]-":"Hloss","[m+hcooh-h]-":"FA","[m+ch3coo]-":"AcO"}
+def std_adduct(s) -> str:
+    if pd.isna(s): return "UNK"
+    s2 = str(s).strip().replace(" ","").lower()
+    return ADDUCT_MAP.get(s2, s)
+
+def pick(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
+    for c in cands:
+        if c in df.columns: return c
+    return None
+
+def winsorize_series(x: pd.Series, p1=0.02, p99=0.98) -> pd.Series:
+    x = pd.to_numeric(x, errors="coerce")
+    lo, hi = np.nanquantile(x, p1), np.nanquantile(x, p99)
+    return x.clip(lo, hi)
+
+# ====================== Plot helpers ======================
+def _ensure_dir(p: str) -> str:
+    os.makedirs(p, exist_ok=True); return p
+
+def _save_parity_scatter(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    m = y.notna() & p.notna()
+    if m.sum() < 3: return
+    y = y[m].to_numpy(float); p = p[m].to_numpy(float)
+    plt.figure(figsize=(4.2, 4.2), dpi=PLOTS_DPI)
+    plt.scatter(y, p, s=12, alpha=0.6)
+    lo = float(np.nanpercentile(np.r_[y, p], 1))
+    hi = float(np.nanpercentile(np.r_[y, p], 99))
+    lo = max(0.0, lo - 0.2); hi = hi + 0.2
+    plt.plot([lo, hi], [lo, hi], lw=1.2)
+    from sklearn.metrics import r2_score, mean_absolute_error
+    r2 = r2_score(y, p)
+    mae = mean_absolute_error(y, p)
+    rmse = float(np.sqrt(np.mean((y - p) ** 2)))
+    plt.title(title or f"Parity | R2={r2:.3f}, MAE={mae:.3f}, RMSE={rmse:.3f}")
+    plt.xlabel("Observed RT (min)"); plt.ylabel("OOF Mapped RT (min)")
+    plt.xlim(lo, hi); plt.ylim(lo, hi); plt.tight_layout()
+    plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _save_abs_error_hist(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    m = y.notna() & p.notna()
+    if m.sum() < 3: return
+    err = np.abs(y[m].to_numpy(float) - p[m].to_numpy(float))
+    plt.figure(figsize=(4.2, 3.2), dpi=PLOTS_DPI)
+    plt.hist(err, bins=30, alpha=0.9)
+    q80 = float(np.quantile(err, 0.80))
+    q95 = float(np.quantile(err, 0.95))
+    plt.axvline(q80, linestyle="--"); plt.axvline(q95, linestyle="--")
+    plt.title(title or f"Abs Error | q80={q80:.3f}, q95={q95:.3f}")
+    plt.xlabel("|Error| (min)"); plt.ylabel("Count")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _save_calibration_curve(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    m = y.notna() & p.notna()
+    if m.sum() < 10: return
+    y = y[m].to_numpy(float); p = p[m].to_numpy(float)
+    q = np.quantile(p, np.linspace(0, 1, 11))
+    idx = np.digitize(p, q[1:-1], right=True)
+    pb = []; yb = []
+    for b in range(10):
+        mb = (idx == b)
+        if np.sum(mb) < 3: continue
+        pb.append(np.mean(p[mb])); yb.append(np.mean(y[mb]))
+    if len(pb) < 3: return
+    lo = float(np.nanpercentile(np.r_[yb, pb], 1))
+    hi = float(np.nanpercentile(np.r_[yb, pb], 99))
+    lo = max(0.0, lo - 0.2); hi = hi + 0.2
+    plt.figure(figsize=(4.2, 4.2), dpi=PLOTS_DPI)
+    plt.plot([lo, hi], [lo, hi], lw=1.2)
+    plt.scatter(pb, yb, s=35)
+    plt.xlabel("Predicted (binned mean)"); plt.ylabel("Observed (binned mean)")
+    plt.title(title or "Calibration (binned)"); plt.xlim(lo, hi); plt.ylim(lo, hi)
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _3mer_set(s: str):
+    s = s if isinstance(s, str) else ""
+    return {s[i:i+3] for i in range(max(0, len(s) - 2))}
+
+def _self_nearest_sim(smiles: List[str]) -> np.ndarray:
+    sets = [_3mer_set(s) for s in smiles]
+    sims = np.zeros(len(sets), float)
+    for i, S in enumerate(sets):
+        best = 0.0
+        for j, T in enumerate(sets):
+            if i == j: continue
+            u = len(S | T) or 1
+            inter = len(S & T)
+            sim = inter / u
+            if sim > best: best = sim
+        sims[i] = best
+    return sims
+
+def _save_error_vs_ood(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    if not {"smiles","rt_true","rt_oof_mapped"}.issubset(df_oof.columns): return
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    s = df_oof["smiles"].astype(str)
+    m = y.notna() & p.notna() & s.notna()
+    if m.sum() < 5: return
+    err = np.abs(y[m].to_numpy(float) - p[m].to_numpy(float))
+    sim = _self_nearest_sim(s[m].tolist())
+    plt.figure(figsize=(4.6, 3.6), dpi=PLOTS_DPI)
+    plt.scatter(sim, err, s=14, alpha=0.7)
+    plt.xlabel("Nearest 3-mer similarity in training")
+    plt.ylabel("|OOF error| (min)")
+    plt.title(title or "Error vs. internal OOD-proxy")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+# ===== NEW: extra plots & stats =====
+def _save_ecdf_abs_error(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    m = y.notna() & p.notna()
+    if m.sum() < 3: return
+    err = np.abs(y[m].to_numpy(float) - p[m].to_numpy(float))
+    xs = np.sort(err)
+    ys = np.arange(1, len(xs)+1) / len(xs)
+    plt.figure(figsize=(4.2, 3.2), dpi=PLOTS_DPI)
+    plt.plot(xs, ys, lw=1.6)
+    plt.xlabel("|Error| (min)"); plt.ylabel("ECDF")
+    plt.title(title or "ECDF of |OOF error|")
+
+    for q in [0.50, 0.80, 0.90, 0.95]:
+        t = float(np.quantile(err, q))
+        plt.axvline(t, linestyle="--", alpha=0.7)
+        plt.text(t, q, f" q{int(q*100)}={t:.2f}", fontsize=8, va="bottom", ha="left")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _lins_ccc(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    y = np.asarray(y_true, float); p = np.asarray(y_pred, float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() < 3: return float("nan")
+    y, p = y[m], p[m]
+    mu_y, mu_p = np.mean(y), np.mean(p)
+    s_y, s_p = np.var(y, ddof=1), np.var(p, ddof=1)
+    r = np.corrcoef(y, p)[0,1]
+    return float((2*r*np.sqrt(s_y)*np.sqrt(s_p)) / (s_y + s_p + (mu_y - mu_p)**2 + 1e-12))
+
+def _slope_through_origin(x: np.ndarray, y: np.ndarray) -> float:
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 2: return float("nan")
+    x, y = x[m], y[m]
+    return float((x*y).sum() / (x*x).sum())
+
+def _r0_squared(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float,float]:
+    y = np.asarray(y_true, float); p = np.asarray(y_pred, float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() < 3: return (float("nan"), float("nan"))
+    y, p = y[m], p[m]
+    k  = _slope_through_origin(p, y)             # y ≈ k * p
+    kp = _slope_through_origin(y, p)             # p ≈ k' * y
+    y0 = k * p; p0 = kp * y
+    ss_res = np.sum((y - y0)**2); ss_tot = np.sum((y - y.mean())**2) + 1e-12
+    ss_res_p = np.sum((p - p0)**2); ss_tot_p = np.sum((p - p.mean())**2) + 1e-12
+    r0  = 1.0 - ss_res   / ss_tot
+    r0p = 1.0 - ss_res_p / ss_tot_p
+    return float(r0), float(r0p)
+
+def _rm2_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    y = np.asarray(y_true, float); p = np.asarray(y_pred, float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() < 3:
+        return {"rm2": np.nan, "rm2_rev": np.nan, "rm2_avg": np.nan, "k": np.nan, "k_prime": np.nan}
+    y, p = y[m], p[m]
+    r2 = float(np.corrcoef(y, p)[0,1]**2)
+    r0, r0p = _r0_squared(y, p)
+    def rm2(r2, r0): return float(r2 * (1 - np.sqrt(abs(r2 - r0))))
+    k  = _slope_through_origin(p, y)   # y ≈ k * p
+    kp = _slope_through_origin(y, p)   # p ≈ k' * y
+    return {"rm2": rm2(r2, r0), "rm2_rev": rm2(r2, r0p), "rm2_avg": (rm2(r2, r0)+rm2(r2, r0p))/2.0,
+            "k": float(k), "k_prime": float(kp)}
+
+def _extra_regression_stats(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
+    err = np.abs(np.asarray(y_true, float) - np.asarray(y_pred, float))
+    medae = float(np.nanmedian(err))
+    ccc = _lins_ccc(y_true, y_pred)
+    rm2s = _rm2_stats(y_true, y_pred)
+    return {"MedAE": medae, "CCC": ccc, **rm2s}
+
+def _compute_williams(X: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[pd.DataFrame, float]:
+    y = np.asarray(y_true, float); p = np.asarray(y_pred, float)
+    m = np.isfinite(y) & np.isfinite(p)
+    X = np.asarray(X, float)
+    if X.ndim != 2 or X.shape[0] != len(y):
+        return pd.DataFrame(), np.nan
+    X1 = np.hstack([np.ones((X.shape[0],1)), X])
+    XtX_inv = np.linalg.pinv(X1.T @ X1)
+    h = np.einsum("ij,jk,ik->i", X1, XtX_inv, X1)
+    resid = y - p
+    p_dim = X1.shape[1]
+    s = np.sqrt(np.sum(resid[m]**2) / max(1, m.sum()-p_dim))
+    std_resid = resid / (s + 1e-12)
+    h_star = 3.0 * p_dim / max(1, len(y))
+    df = pd.DataFrame({"leverage": h, "std_resid": std_resid})
+    return df, float(h_star)
+
+def _save_williams_plot(w_df: pd.DataFrame, h_star: float, out_path: str, title: str=""):
+    if w_df is None or w_df.empty: return
+    plt.figure(figsize=(4.8, 3.6), dpi=PLOTS_DPI)
+    plt.scatter(w_df["leverage"], w_df["std_resid"], s=14, alpha=0.7)
+    plt.axhline( 3.0, linestyle="--"); plt.axhline(-3.0, linestyle="--")
+    plt.axvline(h_star, linestyle="--")
+    plt.xlabel("Leverage (h)"); plt.ylabel("Standardized residual")
+    plt.title(title or f"Williams plot (h*={h_star:.3f})")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _nearest_tanimoto_self(smiles: List[str], n_bits:int=2048, radius:int=2) -> np.ndarray:
+    if not HAS_RDKIT: return np.zeros(len(smiles), float)
+    F = morgan_fp_dense(smiles, n_bits=n_bits, radius=radius).astype(bool)
+    inter = F @ F.T
+    a = np.sum(F, axis=1, keepdims=True)
+    denom = a + a.T - inter + 1e-12
+    sim = inter / denom
+    np.fill_diagonal(sim, -1.0)
+    return sim.max(axis=1)
+
+def _nearest_tanimoto_to_train(train_smiles: List[str], test_smiles: List[str],
+                               train_names: List[str], n_bits:int=2048, radius:int=2, thresh:float=0.2):
+    if not HAS_RDKIT:
+        return [0.0]*len(test_smiles), [None]*len(test_smiles), [1]*len(test_smiles)
+    Ft = morgan_fp_dense(train_smiles, n_bits=n_bits, radius=radius).astype(bool)
+    Fe = morgan_fp_dense(test_smiles,  n_bits=n_bits, radius=radius).astype(bool)
+    inter = Fe @ Ft.T
+    a = np.sum(Fe, axis=1, keepdims=True)
+    b = np.sum(Ft, axis=1, keepdims=True).T
+    denom = a + b - inter + 1e-12
+    sim = inter / denom
+    j = np.argmax(sim, axis=1)
+    best = sim[np.arange(sim.shape[0]), j]
+    nearest = [train_names[int(idx)] if sim.shape[1]>0 else None for idx in j]
+    flags = [int(s<thresh) for s in best]
+    return best.tolist(), nearest, flags
+
+def _save_error_vs_tanimoto(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    if not {"smiles","rt_true","rt_oof_mapped"}.issubset(df_oof.columns): return
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce")
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce")
+    s = df_oof["smiles"].astype(str).tolist()
+    m = y.notna() & p.notna()
+    if m.sum() < 5: return
+    err = np.abs((y - p).to_numpy(float))[m.values]
+    sim = _nearest_tanimoto_self([s[i] for i,flag in enumerate(m) if flag])
+    plt.figure(figsize=(4.6, 3.6), dpi=PLOTS_DPI)
+    plt.scatter(sim, err, s=14, alpha=0.7)
+    plt.xlabel("Nearest Tanimoto similarity (train)")
+    plt.ylabel("|OOF error| (min)")
+    plt.title(title or "Error vs. Tanimoto similarity")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _save_box_err_by_adduct(df_oof: pd.DataFrame, out_path: str, title: str = ""):
+    if not {"adduct","rt_true","rt_oof_mapped"}.issubset(df_oof.columns): return
+    d = df_oof.copy()
+    d["abs_err"] = np.abs(pd.to_numeric(d["rt_true"], errors="coerce") - pd.to_numeric(d["rt_oof_mapped"], errors="coerce"))
+    g = d.groupby("adduct")["abs_err"].apply(list)
+    if len(g) < 1: return
+    plt.figure(figsize=(max(4.8, 0.6*len(g)), 3.6), dpi=PLOTS_DPI)
+    plt.boxplot(g.tolist(), tick_labels=g.index.tolist(), showfliers=False)
+    plt.xticks(rotation=45, ha="right"); plt.ylabel("|OOF error| (min)")
+    plt.title(title or "Abs error by adduct")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _save_box_err_by_mode(pos_df: Optional[pd.DataFrame], neg_df: Optional[pd.DataFrame], out_path: str):
+    dfs=[]; labs=[]
+    if pos_df is not None and len(pos_df)>0:
+        dd = pos_df.copy()
+        dd["abs_err"] = np.abs(pd.to_numeric(dd["rt_true"], errors="coerce") - pd.to_numeric(dd["rt_oof_mapped"], errors="coerce"))
+        dfs.append(dd["abs_err"].dropna().values); labs.append("POS")
+    if neg_df is not None and len(neg_df)>0:
+        dd = neg_df.copy()
+        dd["abs_err"] = np.abs(pd.to_numeric(dd["rt_true"], errors="coerce") - pd.to_numeric(dd["rt_oof_mapped"], errors="coerce"))
+        dfs.append(dd["abs_err"].dropna().values); labs.append("NEG")
+    if not dfs: return
+    plt.figure(figsize=(4.2, 3.2), dpi=PLOTS_DPI)
+
+    try:
+        plt.boxplot(dfs, labels=labs, showfliers=False)
+    except TypeError:
+        plt.boxplot(dfs, tick_labels=labs, showfliers=False)
+
+    plt.ylabel("|OOF error| (min)"); plt.title("Abs error by ion_mode")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+def _save_pi_calibration_curve_kfold(df_oof: pd.DataFrame, out_path: str, n_splits:int=5, seed:int=SEED):
+    y = pd.to_numeric(df_oof["rt_true"], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(df_oof["rt_oof_mapped"], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    y, p = y[m], p[m]
+    if y.size < 15: return
+    err = np.abs(y - p)
+    kf = KFold(n_splits=min(n_splits, max(3, y.size//5)), shuffle=True, random_state=seed)
+    alphas = np.linspace(0.5, 0.99, 11)
+    covs = np.zeros((len(alphas),), float)
+    cnt = 0
+    for tr, va in kf.split(err):
+        e_tr, e_va = err[tr], err[va]
+        for i,a in enumerate(alphas):
+            t = np.quantile(e_tr, a)
+            covs[i] += np.mean(e_va <= t)
+        cnt += 1
+    covs = covs / max(1, cnt)
+    plt.figure(figsize=(4.2, 4.0), dpi=PLOTS_DPI)
+    plt.plot(alphas, alphas, lw=1.0)  # ideal line
+    plt.plot(alphas, covs, marker="o")
+    plt.xlabel("Nominal coverage"); plt.ylabel("Actual coverage (KFold)")
+    plt.title("PI calibration (nominal vs actual)")
+    plt.tight_layout(); plt.savefig(out_path, format=PLOTS_FMT); plt.close()
+
+    pd.DataFrame({"nominal": alphas, "actual": covs}).to_csv(out_path.replace(f".{PLOTS_FMT}", ".csv"), index=False)
+
+# ---------------------- Correlation / metrics --------------------
+def _pearson_abs_safe(xv: np.ndarray, yv: np.ndarray) -> float:
+    m = np.isfinite(xv) & np.isfinite(yv); n = int(m.sum())
+    if n < 6: return 0.0
+    xm = xv[m]; ym = yv[m]
+    sx = np.std(xm); sy = np.std(ym)
+    if not np.isfinite(sx) or not np.isfinite(sy) or sx <= 1e-12 or sy <= 1e-12: return 0.0
+    x0 = xm - xm.mean(); y0 = ym - ym.mean()
+    num = float(np.dot(x0, y0)); den = float(np.sqrt(np.dot(x0, x0)) * np.sqrt(np.dot(y0, y0)) + 1e-12)
+    r = num / den
+    return abs(r) if np.isfinite(r) else 0.0
+
+def safe_corr_with_target(X: pd.DataFrame, y: pd.Series) -> pd.Series:
+    yv = pd.to_numeric(y, errors="coerce").to_numpy()
+    out = {}
+    for c in X.columns:
+        xv = pd.to_numeric(X[c], errors="coerce").to_numpy()
+        out[c] = _pearson_abs_safe(xv, yv)
+    return pd.Series(out)
+
+def spearman_rho(y: np.ndarray, p: np.ndarray) -> float:
+    y_rank = pd.Series(y).rank().to_numpy()
+    p_rank = pd.Series(p).rank().to_numpy()
+    y_c = y_rank - y_rank.mean(); p_c = p_rank - p_rank.mean()
+    denom = (np.sqrt((y_c**2).sum()) * np.sqrt((p_c**2).sum())) + 1e-12
+    return float((y_c*p_c).sum()/denom)
+
+def metrics(y, p) -> Dict[str,float]:
+    m = ~np.isnan(y) & ~np.isnan(p); y=np.asarray(y,dtype=float)[m]; p=np.asarray(p,dtype=float)[m]
+    return {"MAE": float(mean_absolute_error(y,p)),
+            "RMSE": float(np.sqrt(np.mean((y-p)**2))),
+            "R2": float(r2_score(y,p)),
+            "Spearman": float(spearman_rho(y,p)),
+            "N": int(len(y))}
+
+# ===== NEW: convenience to compute extra stats on OOF (mapped) =====
+def compute_extras_from_oof(oof_df: pd.DataFrame) -> Dict[str, float]:
+    if not {"rt_true","rt_oof_mapped"}.issubset(oof_df.columns):
+        return {}
+    y = pd.to_numeric(oof_df["rt_true"], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(oof_df["rt_oof_mapped"], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() < 3: return {}
+    y, p = y[m], p[m]
+    return _extra_regression_stats(y, p)
+
+# ===== NEW: pooled/macro metrics, coverage, AD summaries =====
+def _load_oof_mode(outdir: str, mode: str) -> Optional[pd.DataFrame]:
+    p = os.path.join(outdir, f"oof_{mode}.csv")
+    if os.path.exists(p):
+        df = pd.read_csv(p)
+
+        need = {"compound_name","smiles","ion_mode","adduct","rt_true","rt_oof_mapped"}
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            return None
+        if "resid" not in df.columns:
+            df["resid"] = pd.to_numeric(df["rt_true"], errors="coerce") - pd.to_numeric(df["rt_oof_mapped"], errors="coerce")
+        return df
+    return None
+
+def _compute_micro_metrics_from_oof(df_list: List[pd.DataFrame]) -> Dict[str,float]:
+    d = pd.concat(df_list, ignore_index=True)
+    y = pd.to_numeric(d["rt_true"], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(d["rt_oof_mapped"], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    y, p = y[m], p[m]
+    return {"MAE": float(mean_absolute_error(y,p)),
+            "RMSE": float(np.sqrt(np.mean((y-p)**2))),
+            "R2": float(r2_score(y,p)),
+            "Spearman": float(spearman_rho(y,p)),
+            "N": int(len(y))}
+
+def _read_single_metrics_csv(outdir: str, mode: str) -> Optional[dict]:
+    p = os.path.join(outdir, f"metrics_{mode}.csv")
+    if not os.path.exists(p): return None
+    df = pd.read_csv(p)
+    return df.iloc[0].to_dict() if len(df)>0 else None
+
+def add_pooled_macro_rows(outdir: str, summary_rows: list) -> list:
+    dfs = []
+    for m in ("POS","NEG"):
+        df = _load_oof_mode(outdir, m)
+        if df is not None and len(df)>0: dfs.append(df)
+    if dfs:
+        micro = _compute_micro_metrics_from_oof(dfs)
+        pooled_row = {"mode":"POOLED(micro)", **micro,
+                      "q80_abs_err": np.nan, "q95_abs_err": np.nan,
+                      "anchors_used": np.nan, "n_train": np.nan, "n_test": np.nan,
+                      "target_space": "summary", "cov80": np.nan, "cov95": np.nan}
+        safe_to_csv(pd.DataFrame([pooled_row]), os.path.join(outdir, "metrics_POOLED.csv"), index=False)
+        summary_rows.append(pooled_row)
+
+    mp = _read_single_metrics_csv(outdir, "POS")
+    mn = _read_single_metrics_csv(outdir, "NEG")
+    if (mp is not None) and (mn is not None):
+        macro_mae  = float(mp.get("MAE", np.nan) + mn.get("MAE", np.nan)) / 2.0
+        macro_rmse = float(mp.get("RMSE", np.nan) + mn.get("RMSE", np.nan)) / 2.0
+        macro_row = {"mode":"MACRO(avg)", "MAE":macro_mae, "RMSE":macro_rmse,
+                     "R2": np.nan, "Spearman": np.nan,
+                     "N": int((mp.get("N",0) or 0) + (mn.get("N",0) or 0)),
+                     "q80_abs_err": np.nan, "q95_abs_err": np.nan,
+                     "anchors_used": np.nan, "n_train": np.nan, "n_test": np.nan,
+                     "target_space": "summary", "cov80": np.nan, "cov95": np.nan}
+        safe_to_csv(pd.DataFrame([macro_row]), os.path.join(outdir, "metrics_MACRO.csv"), index=False)
+        summary_rows.append(macro_row)
+    return summary_rows
+
+def compute_cov_from_oof(oof_df: pd.DataFrame, q80: float, q95: float) -> Tuple[float,float]:
+    if ("resid" not in oof_df.columns) or (oof_df["resid"].isna().all()):
+        return (np.nan, np.nan)
+    r = oof_df["resid"].abs().to_numpy(float)
+    cov80 = float(np.mean(r <= float(q80))) if np.isfinite(q80) else np.nan
+    cov95 = float(np.mean(r <= float(q95))) if np.isfinite(q95) else np.nan
+    return cov80, cov95
+
+
+def _ad_train_bins(oof_df: pd.DataFrame, bins: np.ndarray = np.linspace(0,1,11)) -> pd.DataFrame:
+    if "smiles" not in oof_df.columns or "resid" not in oof_df.columns:
+        return pd.DataFrame()
+    sim = _self_nearest_sim(oof_df["smiles"].astype(str).tolist())
+    err = np.abs(pd.to_numeric(oof_df["resid"], errors="coerce").to_numpy(float))
+    cut = np.digitize(sim, bins[1:-1], right=True)
+    rows=[]
+    for b in range(len(bins)-1):
+        mb = (cut == b)
+        if np.sum(mb) < 3:
+            rows.append({"bin_left":float(bins[b]), "bin_right":float(bins[b+1]), "N":int(np.sum(mb)),
+                         "abs_err_mean": np.nan, "abs_err_median": np.nan})
+        else:
+            rows.append({"bin_left":float(bins[b]), "bin_right":float(bins[b+1]), "N":int(np.sum(mb)),
+                         "abs_err_mean": float(np.mean(err[mb])), "abs_err_median": float(np.median(err[mb]))})
+    return pd.DataFrame(rows)
+
+def write_ad_reports(outdir: str):
+    anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+    cand = [os.path.join(outdir, "predicted_rt_theory.csv"),
+            os.path.join(outdir, "predicted_rt.csv")]
+    pred_path = next((p for p in cand if os.path.exists(p)), None)
+
+    if pred_path:
+        d = pd.read_csv(pred_path)
+
+        if "ion_mode" in d.columns and "OOD_flag" in d.columns:
+            rows=[]
+            for m, g in d.groupby(d["ion_mode"].map(unify_mode)):
+                N = int(len(g))
+                ood = int(pd.to_numeric(g["OOD_flag"], errors="coerce").fillna(0).sum())
+                rate = float(ood / max(1,N))
+                q = np.quantile(pd.to_numeric(g.get("nearest_sim", np.nan), errors="coerce").dropna(), [0.1,0.5,0.9]) if "nearest_sim" in g.columns else [np.nan]*3
+                rows.append({"mode": m, "N_pred": N, "OOD_N": ood, "OOD_rate": rate,
+                             "nearest_sim_q10": float(q[0]) if q is not None else np.nan,
+                             "nearest_sim_q50": float(q[1]) if q is not None else np.nan,
+                             "nearest_sim_q90": float(q[2]) if q is not None else np.nan})
+            safe_to_csv(pd.DataFrame(rows), os.path.join(anadir, "ad_summary_predictions.csv"), index=False)
+
+    for m in ("POS","NEG"):
+        df = _load_oof_mode(outdir, m)
+        if df is None or len(df)==0:
+            continue
+        bins = np.linspace(0,1,11)
+        df_bins = _ad_train_bins(df, bins=bins)
+        if len(df_bins)>0:
+            safe_to_csv(df_bins, os.path.join(anadir, f"ad_train_{m}.csv"), index=False)
+
+
+# ======== NEW: coverage & pooled/macro & AD summaries ========
+def _coverage_at_q(y_true: np.ndarray, y_pred: np.ndarray, q: float) -> float:
+    y = np.asarray(y_true, float); p = np.asarray(y_pred, float)
+    m = np.isfinite(y) & np.isfinite(p)
+    if m.sum() == 0: return float("nan")
+    err = np.abs(y[m] - p[m])
+    return float(np.mean(err <= q))
+
+def save_pooled_and_macro_metrics(outdir: str):
+    import os, numpy as np, pandas as pd
+    p_pos = os.path.join(outdir, "oof_POS.csv")
+    p_neg = os.path.join(outdir, "oof_NEG.csv")
+    if not (os.path.exists(p_pos) and os.path.exists(p_neg)):
+        print("[INFO] pooled metrics skipped (need both oof_POS.csv & oof_NEG.csv).")
+        return
+
+    dpos = pd.read_csv(p_pos)
+    dneg = pd.read_csv(p_neg)
+    d = pd.concat([dpos, dneg], axis=0, ignore_index=True)
+    d = d.rename(columns={"rt_true":"rt_true", "rt_oof_mapped":"rt_oof_mapped"})
+    y = pd.to_numeric(d["rt_true"], errors="coerce").to_numpy(float)
+    p = pd.to_numeric(d["rt_oof_mapped"], errors="coerce").to_numpy(float)
+    m = np.isfinite(y) & np.isfinite(p)
+    y = y[m]; p = p[m]
+    if y.size == 0:
+        print("[WARN] pooled metrics: no valid points.")
+        return
+
+    mae = float(np.mean(np.abs(y - p)))
+    rmse = float(np.sqrt(np.mean((y - p) ** 2)))
+    from sklearn.metrics import r2_score
+    r2 = float(r2_score(y, p))
+    sp = float(spearman_rho(y, p))
+    q80 = float(np.quantile(np.abs(y - p), 0.80))
+    q95 = float(np.quantile(np.abs(y - p), 0.95))
+    cov80 = _coverage_at_q(y, p, q80)
+    cov95 = _coverage_at_q(y, p, q95)
+
+    pooled = pd.DataFrame([{
+        "mode": "POOLED(micro)", "MAE": mae, "RMSE": rmse, "R2": r2, "Spearman": sp,
+        "N": int(len(y)), "q80_abs_err": q80, "q95_abs_err": q95,
+        "cov_at_q80": cov80, "cov_at_q95": cov95
+    }])
+    pooled.to_csv(os.path.join(outdir, "metrics_POOLED.csv"), index=False)
+
+    mp = os.path.join(outdir, "metrics_POS.csv")
+    mn = os.path.join(outdir, "metrics_NEG.csv")
+    if os.path.exists(mp) and os.path.exists(mn):
+        mpos = pd.read_csv(mp).iloc[0].to_dict()
+        mneg = pd.read_csv(mn).iloc[0].to_dict()
+        macro = pd.DataFrame([{
+            "mode": "MACRO(avg POS/NEG)",
+            "MAE": float(mpos["MAE"] + mneg["MAE"]) / 2.0,
+            "RMSE": float(mpos["RMSE"] + mneg["RMSE"]) / 2.0,
+            "Spearman": float(mpos.get("Spearman", np.nan) + mneg.get("Spearman", np.nan)) / 2.0,
+            "R2": np.nan,  # R2 is not macro-averaged
+            "N": int(mpos["N"] + mneg["N"])
+        }])
+        macro.to_csv(os.path.join(outdir, "metrics_MACRO.csv"), index=False)
+
+    d.to_csv(os.path.join(outdir, "oof_POOLED.csv"), index=False)
+    print("[OK] Pooled & Macro metrics saved:", os.path.join(outdir, "metrics_POOLED.csv"),
+          "&", os.path.join(outdir, "metrics_MACRO.csv"))
+
+def make_ad_oof_summary(outdir: str):
+    import os, numpy as np, pandas as pd
+    for mode in ("POS", "NEG"):
+        pth = os.path.join(outdir, f"oof_{mode}.csv")
+        if not os.path.exists(pth):
+            continue
+        df = pd.read_csv(pth)
+        if not {"smiles", "rt_true", "rt_oof_mapped"}.issubset(df.columns):
+            continue
+        err = np.abs(pd.to_numeric(df["rt_true"], errors="coerce").to_numpy(float) -
+                     pd.to_numeric(df["rt_oof_mapped"], errors="coerce").to_numpy(float))
+        sim = _self_nearest_sim(df["smiles"].astype(str).tolist())
+        bins = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.01])
+        idx = np.digitize(sim, bins) - 1
+        rows=[]
+        for b in range(len(bins)-1):
+            mb = (idx == b)
+            if np.sum(mb) < 3:
+                continue
+            e = err[mb]
+            rows.append({
+                "bin": f"[{bins[b]:.1f},{bins[b+1]:.1f})",
+                "count": int(len(e)), "MAE": float(np.mean(e)),
+                "q80_abs_err": float(np.quantile(e, 0.80)),
+                "q95_abs_err": float(np.quantile(e, 0.95))
+            })
+        if rows:
+            anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+            pd.DataFrame(rows).to_csv(os.path.join(anadir, f"ad_oof_summary_{mode}.csv"), index=False)
+
+def make_ad_test_summary(outdir: str):
+    import os, pandas as pd, numpy as np
+    cand = [os.path.join(outdir, "predicted_rt_theory.csv"),
+            os.path.join(outdir, "predicted_rt.csv")]
+    pth = next((p for p in cand if os.path.exists(p)), None)
+    if not pth: return
+    df = pd.read_csv(pth)
+
+    if "OOD_flag" not in df.columns: return
+    rows=[]
+    for mode, d in df.groupby("ion_mode"):
+        n = len(d)
+        inside = int((d["OOD_flag"]==0).sum())
+        rows.append({"mode": mode, "N_pred": int(n), "inside_AD": inside, "inside_frac": inside/max(1,n)})
+    if rows:
+        anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+        pd.DataFrame(rows).to_csv(os.path.join(anadir, "ad_test_summary.csv"), index=False)
+
+# --------------------------- Isotonic / mapping ------------------
+def isotonic_fit_apply(oof_pred: np.ndarray, y: np.ndarray, new_pred: np.ndarray):
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof_pred, y)
+    cal_oof = iso.predict(oof_pred)
+    cal_new = iso.predict(new_pred)
+    return cal_oof, cal_new
+
+def _compress_anchors(xy: np.ndarray) -> np.ndarray:
+    if xy.shape[0] <= 1: return xy
+    xy = xy[np.argsort(xy[:,0])]
+    scale = np.nanpercentile(np.abs(xy[:,0]), 90) - np.nanpercentile(np.abs(xy[:,0]), 10)
+    eps = max(1e-6, 1e-3*max(1.0, scale))
+    out = []; i = 0; n = xy.shape[0]
+    while i < n:
+        j = i + 1
+        sx, sy, c = xy[i,0], xy[i,1], 1
+        while j < n and abs(xy[j,0] - xy[i,0]) <= eps:
+            sx += xy[j,0]; sy += xy[j,1]; c += 1; j += 1
+        out.append([sx/c, sy/c]); i = j
+    return np.array(out, dtype=float)
+
+def _pwl_predict(xk: np.ndarray, yk: np.ndarray, x: np.ndarray) -> np.ndarray:
+    xk = np.asarray(xk, float); yk = np.asarray(yk, float); x = np.asarray(x, float)
+    if len(xk) < 4:
+        iso = IsotonicRegression(out_of_bounds="clip"); iso.fit(xk, yk); return iso.predict(x)
+    out = np.empty_like(x, dtype=float)
+    for idx, v in enumerate(x):
+        if v <= xk[0]:
+            t = (v - xk[0]) / (xk[1] - xk[0] + 1e-12); out[idx] = yk[0] + t*(yk[1] - yk[0])
+        elif v >= xk[-1]:
+            t = (v - xk[-2]) / (xk[-1] - xk[-2] + 1e-12); out[idx] = yk[-2] + t*(yk[-1] - yk[-2])
+        else:
+            j = np.searchsorted(xk, v)
+            t = (v - xk[j-1]) / (xk[j] - xk[j-1] + 1e-12); out[idx] = yk[j-1] + t*(yk[j] - yk[j-1])
+    return out
+
+def map_pred_to_rt_safe(train_df_for_map: pd.DataFrame, pred_vals: np.ndarray, spearman_cutoff: float) -> np.ndarray:
+    y_train = train_df_for_map["rt"].to_numpy(float)
+    x_train = train_df_for_map["pred"].to_numpy(float)
+    iso = IsotonicRegression(out_of_bounds="clip"); iso.fit(x_train, y_train)
+    iso_pred_train = iso.predict(x_train); iso_r2 = r2_score(y_train, iso_pred_train)
+    sp = float(spearman_rho(y_train, x_train))
+    anchors = train_df_for_map.loc[train_df_for_map["is_anchor"]==1, ["pred","rt"]].to_numpy(float)
+    if not (np.isfinite(sp) and sp >= spearman_cutoff and anchors.shape[0] >= 6):
+        return iso.predict(pred_vals)
+    anchors = _compress_anchors(anchors[np.argsort(anchors[:,0])])
+    if anchors.shape[0] < 4: return iso.predict(pred_vals)
+    dx = np.diff(anchors[:,0])
+    scale = np.nanpercentile(np.abs(anchors[:,0]), 90) - np.nanpercentile(np.abs(anchors[:,0]), 10)
+    if anchors.shape[0] < 2 or scale <= 0 or np.nanmin(dx) < 1e-6 * max(1.0, scale):
+        return iso.predict(pred_vals)
+    pw_train = _pwl_predict(anchors[:,0], anchors[:,1], x_train)
+    rt_q1, rt_q99 = np.quantile(y_train, 0.01), np.quantile(y_train, 0.99)
+    guard_lo = rt_q1 - 2.0; guard_hi = rt_q99 + 2.0
+    bad_range = (np.any(~np.isfinite(pw_train))
+                 or np.nanmax(pw_train) > guard_hi*5
+                 or np.nanmin(pw_train) < guard_lo*5)
+    pw_r2 = -1e-9 if bad_range else r2_score(y_train, pw_train)
+    if (pw_r2 >= iso_r2 + 1e-4) and (pw_r2 > 0.1) and not bad_range:
+        return _pwl_predict(anchors[:,0], anchors[:,1], np.asarray(pred_vals, float))
+    else:
+        return iso.predict(pred_vals)
+
+# --------------------------- Features ----------------------------
+def smiles_char_counts(s: str) -> Dict[str, float]:
+    if not isinstance(s, str): s = "" if pd.isna(s) else str(s)
+    counts = {"len": len(s), "Cl": s.count("Cl"), "Br": s.count("Br")}
+    s1 = s.replace("Cl","*").replace("Br","*")
+    for t in ["C","c","N","n","O","o","S","s","P","p","F","I"]: counts[t] = s1.count(t)
+    for ch in ["(",")","=","#","+","-","[","]","/","\\"]: counts[ch] = s.count(ch)
+    aromatic = counts.get("c",0)+counts.get("n",0)+counts.get("o",0)+counts.get("s",0)+counts.get("p",0)
+    counts["aromatic"]=aromatic; counts["frac_aromatic"]=aromatic/max(1,counts["len"])
+    return counts
+
+def compute_rd_1d2d_df(smiles_list: List[str]) -> pd.DataFrame:
+    cols = ["MolWt","ExactMolWt","MolLogP","TPSA","FracCSP3","NumHBA","NumHBD","NumRotBonds",
+            "HeavyAtomCount","NumRings","NumAromaticRings","NumAliphaticRings","BalabanJ","BertzCT",
+            "Chi0n","Chi1n","Chi0v","Chi1v","Kappa1","Kappa2","Kappa3","HallKierAlpha"]
+    rows=[]
+    for s in smiles_list:
+        if not HAS_RDKIT:
+            rows.append([np.nan]*len(cols)); continue
+        m = Chem.MolFromSmiles(s) if isinstance(s,str) else None
+        if m is None:
+            try: m = Chem.MolFromSmiles(s, sanitize=False); Chem.SanitizeMol(m)
+            except Exception: rows.append([np.nan]*len(cols)); continue
+        try:
+            vals = [RDDesc.MolWt(m), RDMD.CalcExactMolWt(m), RDDesc.MolLogP(m), RDMD.CalcTPSA(m),
+                    RDMD.CalcFractionCSP3(m), RDMD.CalcNumHBA(m), RDMD.CalcNumHBD(m),
+                    RDMD.CalcNumRotatableBonds(m), RDMD.CalcNumHeavyAtoms(m),
+                    RDMD.CalcNumRings(m), RDMD.CalcNumAromaticRings(m), RDMD.CalcNumAliphaticRings(m),
+                    RDDesc.BalabanJ(m), RDDesc.BertzCT(m), RDDesc.Chi0n(m), RDDesc.Chi1n(m),
+                    RDDesc.Chi0v(m), RDDesc.Chi1v(m), RDDesc.Kappa1(m), RDDesc.Kappa2(m),
+                    RDDesc.Kappa3(m), RDDesc.HallKierAlpha(m)]
+        except Exception:
+            vals = [np.nan]*len(cols)
+        rows.append(vals)
+    return pd.DataFrame(rows, columns=[f"rd12_{c}" for c in cols])
+
+def _embed_and_optimize_3d(m: "Chem.Mol") -> Optional["Chem.Mol"]:
+    try:
+        if m is None: return None
+        m3d = Chem.AddHs(m)
+        params = AllChem.ETKDGv3() if hasattr(AllChem, "ETKDGv3") else AllChem.ETKDG()
+        params.maxAttempts = EMBED_MAXITERS; params.randomSeed = SEED
+        code = AllChem.EmbedMolecule(m3d, params)
+        if code != 0: return None
+        if USE_3D_MMFF_OPT:
+            try:
+                if AllChem.MMFFHasAllMoleculeParams(m3d):
+                    AllChem.MMFFOptimizeMolecule(m3d, maxIters=200)
+                else:
+                    AllChem.UFFOptimizeMolecule(m3d, maxIters=200)
+            except Exception:
+                try: AllChem.UFFOptimizeMolecule(m3d, maxIters=200)
+                except Exception: pass
+        return m3d
+    except Exception:
+        return None
+
+def compute_rd_3d_df(smiles_list: List[str]) -> pd.DataFrame:
+    cols = ["RadiusOfGyration","InertialShapeFactor","Asphericity","Eccentricity",
+            "SpherocityIndex","PMI1","PMI2","PMI3","NPR1","NPR2"]
+    if not HAS_RDKIT or not USE_RD_3D:
+        return pd.DataFrame(np.nan, index=range(len(smiles_list)), columns=[f"rd3d_{c}" for c in cols])
+    out=[]; n_fail=0
+    for s in smiles_list:
+        m = Chem.MolFromSmiles(s) if isinstance(s,str) else None
+        m3d = _embed_and_optimize_3d(m) if m is not None else None
+        if m3d is None:
+            out.append([np.nan]*len(cols)); n_fail+=1; continue
+        try:
+            vals = [RDMD.CalcRadiusOfGyration(m3d), RDMD.CalcInertialShapeFactor(m3d),
+                    RDMD.CalcAsphericity(m3d), RDMD.CalcEccentricity(m3d),
+                    RDMD.CalcSpherocityIndex(m3d), RDMD.CalcPMI1(m3d), RDMD.CalcPMI2(m3d),
+                    RDMD.CalcPMI3(m3d), RDMD.CalcNPR1(m3d), RDMD.CalcNPR2(m3d)]
+        except Exception:
+            vals=[np.nan]*len(cols); n_fail+=1
+        out.append(vals)
+    fail_ratio = n_fail / max(1,len(smiles_list))
+    if fail_ratio > MAX_3D_FAIL_RATIO:
+        return pd.DataFrame(np.nan, index=range(len(smiles_list)), columns=[f"rd3d_{c}" for c in cols])
+    return pd.DataFrame(out, columns=[f"rd3d_{c}" for c in cols])
+
+# ---------- 3D  ----------
+def _cache_dir(outdir:str) -> str:
+    return makedirs(os.path.join(outdir, "cache"))
+
+def _3d_cache_name(outdir:str) -> str:
+    tag = f"mmff{int(USE_3D_MMFF_OPT)}_iters{EMBED_MAXITERS}_seed{SEED}"
+    return os.path.join(_cache_dir(outdir), f"rd3d_cache_{tag}.parquet")
+
+def compute_rd_3d_df_cached(smiles_list: List[str], outdir:str) -> pd.DataFrame:
+    cols = [f"rd3d_{c}" for c in ["RadiusOfGyration","InertialShapeFactor","Asphericity","Eccentricity",
+                                   "SpherocityIndex","PMI1","PMI2","PMI3","NPR1","NPR2"]]
+    df_out = pd.DataFrame(index=range(len(smiles_list)), columns=cols, dtype=float)
+    if not (HAS_RDKIT and USE_RD_3D):
+        return df_out
+
+    cache_path = _3d_cache_name(outdir)
+    cache_csv  = cache_path.replace(".parquet", ".csv")
+    cache = None
+
+    if USE_3D_CACHE:
+        if os.path.exists(cache_path):
+            try:
+                cache = pd.read_parquet(cache_path)
+            except Exception:
+                cache = None
+        if cache is None and os.path.exists(cache_csv):
+            try:
+                cache = pd.read_csv(cache_csv)
+            except Exception:
+                cache = None
+
+    if cache is not None and "smiles" in cache.columns:
+        cache = cache.drop_duplicates("smiles").set_index("smiles")
+    else:
+        cache = pd.DataFrame(columns=["smiles"]+cols).set_index("smiles")
+
+    todo_idx = []
+    for i, s in enumerate(smiles_list):
+        s = str(s)
+        if s in cache.index:
+            df_out.iloc[i,:] = cache.loc[s, cols].values
+        else:
+            todo_idx.append(i)
+
+    if todo_idx:
+        work_smiles = [str(smiles_list[i]) for i in todo_idx]
+        df_new = compute_rd_3d_df(work_smiles)
+        df_new.insert(0, "smiles", work_smiles)
+        df_new = df_new.set_index("smiles")
+
+        if not df_new.empty:
+            for c in cache.columns.difference(df_new.columns):
+                df_new[c] = np.nan
+            for c in df_new.columns.difference(cache.columns):
+                cache[c] = np.nan
+            df_new = df_new[cache.columns]
+
+            # if df_new.notna().any(axis=1).sum() == 0:
+            #     pass
+            # else:
+            cache = pd.concat([cache, df_new], axis=0)
+
+        cache = cache[~cache.index.duplicated(keep="last")]
+
+        try:
+            cache.reset_index().to_parquet(cache_path, index=False)
+        except Exception:
+            pass
+        try:
+            cache.reset_index().to_csv(cache_csv, index=False, encoding="utf-8")
+        except Exception:
+            pass
+
+        for pos, idx in enumerate(todo_idx):
+            df_out.iloc[idx,:] = df_new.iloc[pos,:].values
+
+    return df_out
+
+# ----------------------------- FP --------------------------------
+def morgan_fp_dense(smiles, n_bits=2048, radius=2):
+    X = np.zeros((len(smiles), n_bits), dtype=np.float32)
+    if not HAS_RDKIT: return X
+    for i, s in enumerate(smiles):
+        m = Chem.MolFromSmiles(str(s)) if isinstance(s, str) else None
+        if m is None: continue
+        bv = RDMD.GetMorganFingerprintAsBitVect(m, radius, nBits=n_bits)
+        arr = np.zeros((n_bits,), dtype=int); DataStructs.ConvertToNumpyArray(bv, arr)
+        X[i,:]=arr
+    return X
+
+def add_fp_block(Xtr_num, Xte_num, smiles_tr, smiles_te, use_fp, n_bits, radius, n_comp, seed=SEED):
+    if not use_fp or not HAS_RDKIT: return Xtr_num, Xte_num, []
+    Ftr = morgan_fp_dense(smiles_tr, n_bits, radius)
+    Fte = morgan_fp_dense(smiles_te, n_bits, radius)
+    svd = TruncatedSVD(n_components=n_comp, random_state=seed)
+    Ftr_s = svd.fit_transform(Ftr); Fte_s = svd.transform(Fte)
+    names = [f"fp_svd_{i}" for i in range(Ftr_s.shape[1])]
+    Xtr = pd.concat([Xtr_num.reset_index(drop=True), pd.DataFrame(Ftr_s, columns=names)], axis=1)
+    Xte = pd.concat([Xte_num.reset_index(drop=True), pd.DataFrame(Fte_s, columns=names)], axis=1)
+    return Xtr, Xte, names
+
+# ----------------------- Speed profile ----------------------------
+def _profile_params(profile:str):
+    prof = (profile or "").lower()
+    if prof == "fast":
+        return dict(
+            et_n1=400, et_n2=600, et_nf=900,
+            gbdt_lr1=0.08, gbdt_n1=450, gbdt_lr2=0.06, gbdt_n2=650, gbdt_nf=900,
+            krr_min_n=60,
+            scramble_runs=max(10, RUN_SCRAMBLE//2)
+        )
+    if prof == "exact":
+        return dict(
+            et_n1=800, et_n2=1000, et_nf=1400,
+            gbdt_lr1=0.06, gbdt_n1=650, gbdt_lr2=0.05, gbdt_n2=800, gbdt_nf=1000,
+            krr_min_n=30,
+            scramble_runs=RUN_SCRAMBLE
+        )
+    # balanced (default)
+    return dict(
+        et_n1=800, et_n2=1000, et_nf=1200,
+        gbdt_lr1=0.06, gbdt_n1=600, gbdt_lr2=0.05, gbdt_n2=750, gbdt_nf=1000,
+        krr_min_n=45,
+        scramble_runs=RUN_SCRAMBLE
+    )
+
+# ----------------------- Feature matrix ---------------------------
+def build_feature_matrices(train: pd.DataFrame, test: pd.DataFrame,
+                           use_fp: int, fp_bits: int, fp_radius: int, fp_svd: int,
+                           use_rd_1d2d: int, use_rd_3d: int, outdir: Optional[str]=None):
+    blocks_tr = []; blocks_te = []
+
+    def numeric_cols(df: pd.DataFrame) -> List[str]:
+        cols=[]
+        for c in df.columns:
+            if c in ("rt","compound_name","smiles","ion_mode","adduct","t0","target"): continue
+            ser = pd.to_numeric(df[c], errors="coerce")
+            if ser.notna().mean() > 0.80: cols.append(c)
+        return cols
+    nums_tr = set(numeric_cols(train)); nums_te = set(numeric_cols(test))
+    common  = sorted(list(nums_tr & nums_te))
+    if len(common) > 0:
+        Xtr0 = train[common].apply(pd.to_numeric, errors="coerce").copy()
+        Xte0 = test[common].apply(pd.to_numeric, errors="coerce").copy()
+        blocks_tr.append(Xtr0); blocks_te.append(Xte0)
+
+    Xtr_sc = pd.DataFrame([smiles_char_counts(s) for s in train["smiles"].astype(str)])
+    Xte_sc = pd.DataFrame([smiles_char_counts(s) for s in test["smiles"].astype(str)])
+    blocks_tr.append(Xtr_sc); blocks_te.append(Xte_sc)
+
+    # RDKit 1D/2D
+    if use_rd_1d2d and HAS_RDKIT:
+        t0,_ = tic()
+        Xtr_12 = compute_rd_1d2d_df(train["smiles"].astype(str).tolist())
+        Xte_12 = compute_rd_1d2d_df(test["smiles"].astype(str).tolist())
+        toc(t0, "RDKit 1D/2D")
+        blocks_tr.append(Xtr_12); blocks_te.append(Xte_12)
+
+    # RDKit 3D
+    if use_rd_3d and HAS_RDKIT:
+        t0,_ = tic()
+        if USE_3D_CACHE and outdir:
+            Xtr_3d = compute_rd_3d_df_cached(train["smiles"].astype(str).tolist(), outdir)
+            Xte_3d = compute_rd_3d_df_cached(test["smiles"].astype(str).tolist(), outdir)
+        else:
+            Xtr_3d = compute_rd_3d_df(train["smiles"].astype(str).tolist())
+            Xte_3d = compute_rd_3d_df(test["smiles"].astype(str).tolist())
+        toc(t0, "RDKit 3D (with cache)" if USE_3D_CACHE else "RDKit 3D")
+        blocks_tr.append(Xtr_3d); blocks_te.append(Xte_3d)
+
+    if len(blocks_tr) == 0:
+        Xtr_all = pd.DataFrame(index=range(len(train))); Xte_all = pd.DataFrame(index=range(len(test)))
+    else:
+        Xtr_all = pd.concat(blocks_tr, axis=1); Xte_all = pd.concat(blocks_te, axis=1)
+
+    valid_cols = []
+    for c in Xtr_all.columns:
+        col = pd.to_numeric(Xtr_all[c], errors="coerce")
+        if col.notna().sum() < max(6, int(0.2 * len(col))): continue
+        if col.nunique(dropna=True) < 2: continue
+        valid_cols.append(c)
+    if len(valid_cols)==0: valid_cols = Xtr_all.columns.tolist()
+    Xtr_all = Xtr_all[valid_cols].copy(); Xte_all = Xte_all[valid_cols].copy()
+
+    try:
+        corr_all  = safe_corr_with_target(Xtr_all, train["target"])
+        keep_cols = corr_all.sort_values(ascending=False).head(CORR_FILTER_TOPN).index.tolist()
+    except Exception:
+        keep_cols = Xtr_all.columns.tolist()[:CORR_FILTER_TOPN]
+    Xtr_num = Xtr_all[keep_cols].copy(); Xte_num = Xte_all[keep_cols].copy()
+
+    # FP
+    Xtr_num, Xte_num, _ = add_fp_block(
+        Xtr_num, Xte_num,
+        train["smiles"].tolist(), test["smiles"].tolist(),
+        use_fp, FP_BITS, FP_RADIUS, FP_SVD, seed=SEED
+    )
+
+    # One-Hot
+    try:
+        enc = OneHotEncoder(handle_unknown="ignore", sparse_output=False, dtype=np.float32)
+    except TypeError:
+        enc = OneHotEncoder(handle_unknown="ignore", sparse=False, dtype=np.float32)
+    Ztr = enc.fit_transform(train[["ion_mode","adduct"]].astype(str))
+    Zte = enc.transform(test[["ion_mode","adduct"]].astype(str))
+
+    Xtr_full = np.hstack([Ztr, Xtr_num.fillna(Xtr_num.mean()).to_numpy(dtype=float)])
+    Xte_full = np.hstack([Zte, Xte_num.fillna(Xtr_num.mean()).to_numpy(dtype=float)])
+    num_means = Xtr_num.mean(numeric_only=True)
+    return enc, Xtr_full, Xte_full, keep_cols, num_means
+
+# ----------------------- Schema save/load & rebuild -----------------------
+def save_schema(path: str, enc: OneHotEncoder, keep_cols: list, num_means: pd.Series):
+    try:
+        schema = {
+            "enc": enc,
+            "keep_cols": list(keep_cols),
+            "num_means": {k: float(v) for k, v in dict(num_means).items()}
+        }
+        with open(path, "wb") as f:
+            pickle.dump(schema, f)
+    except Exception as e:
+        print("[WARN] save_schema failed:", e)
+
+def load_schema(path: str):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def features_from_schema(df: pd.DataFrame, schema: dict,
+                         use_fp: int, fp_bits: int, fp_radius: int, fp_svd: int,
+                         use_rd_1d2d: int, use_rd_3d: int, outdir: Optional[str]=None) -> np.ndarray:
+
+    def numeric_cols_single(d: pd.DataFrame) -> list:
+        cols=[]
+        for c in d.columns:
+            if c in ("rt","compound_name","smiles","ion_mode","adduct","t0","target"):
+                continue
+            ser = pd.to_numeric(d[c], errors="coerce")
+            if ser.notna().mean() > 0.80:
+                cols.append(c)
+        return cols
+
+    blocks = []
+
+    num_cols_here = numeric_cols_single(df)
+    if len(num_cols_here) > 0:
+        blocks.append(df[num_cols_here].apply(pd.to_numeric, errors="coerce"))
+
+    sc = pd.DataFrame([smiles_char_counts(s) for s in df["smiles"].astype(str)])
+    blocks.append(sc)
+
+    if use_rd_1d2d and HAS_RDKIT:
+        X12 = compute_rd_1d2d_df(df["smiles"].astype(str).tolist())
+        blocks.append(X12)
+
+    if use_rd_3d and HAS_RDKIT:
+        if USE_3D_CACHE and outdir:
+            X3d = compute_rd_3d_df_cached(df["smiles"].astype(str).tolist(), outdir)
+        else:
+            X3d = compute_rd_3d_df(df["smiles"].astype(str).tolist())
+        blocks.append(X3d)
+
+    X_all = pd.concat(blocks, axis=1) if blocks else pd.DataFrame(index=range(len(df)))
+
+    keep_cols = list(schema["keep_cols"])
+    X_num = X_all.reindex(columns=keep_cols)
+
+    means = schema.get("num_means", {})
+    for c in keep_cols:
+        fillv = means.get(c, float(np.nan))
+        X_num[c] = pd.to_numeric(X_num[c], errors="coerce").fillna(fillv)
+
+    enc = schema["enc"]
+    Z = enc.transform(df[["ion_mode","adduct"]].astype(str))
+
+    X_full = np.hstack([Z, X_num.to_numpy(dtype=float)])
+    return X_full
+
+# -------------------------- Model / CV ----------------------------
+def estimate_gamma_median(X: np.ndarray, max_samples: int = 400, seed: int = SEED,
+                          dim_correction: bool = True) -> float:
+    rs = np.random.RandomState(seed)
+    Xs = X[rs.choice(X.shape[0], size=max_samples, replace=False)] if X.shape[0] > max_samples else X
+    d2 = np.sum((Xs[:,None,:]-Xs[None,:,:])**2, axis=2)
+    tri = d2[np.triu_indices(d2.shape[0],1)]
+    med = np.median(tri[tri>0]) if np.any(tri>0) else np.var(Xs)
+    if not np.isfinite(med) or med<=0: med=1.0
+    if dim_correction: med = med / max(1, Xs.shape[1])
+    return float(np.clip(1.0/(2.0*med), 1e-6, 1e3))
+
+def tukey_weights(resid: np.ndarray, c: float) -> np.ndarray:
+    r = np.abs(resid)
+    s = 1.4826 * np.median(r + 1e-12); s = max(s, 1e-6)
+    u = r / (c * s)
+    w = (1 - u**2)**2; w[u>=1] = 0.0
+    return w
+
+def train_cv_ensemble_robust(X: np.ndarray, y: np.ndarray, n_splits=5, seed=SEED, use_krr=USE_KRR) -> Tuple[Any,np.ndarray,Dict[str,float],np.ndarray]:
+    P = _profile_params(SPEED_PROFILE)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    oof = np.zeros_like(y, dtype=float)
+
+    # First pass
+    for tr, va in kf.split(X):
+        Xtr,Xva = X[tr],X[va]; ytr,yva = y[tr],y[va]
+        m1 = ExtraTreesRegressor(n_estimators=P["et_n1"], min_samples_leaf=2, random_state=seed, n_jobs=N_JOBS)
+        m2 = GradientBoostingRegressor(learning_rate=P["gbdt_lr1"], n_estimators=P["gbdt_n1"], max_depth=3, random_state=seed)
+        m1.fit(Xtr,ytr); m2.fit(Xtr,ytr)
+        p1 = m1.predict(Xva); p2 = m2.predict(Xva)
+        preds=[p1,p2]; maes=[mean_absolute_error(yva,p1)+1e-9, mean_absolute_error(yva,p2)+1e-9]
+        if use_krr and len(ytr) >= P["krr_min_n"]:
+            scaler = StandardScaler(); Xtr_s=scaler.fit_transform(Xtr); Xva_s=scaler.transform(Xva)
+            g = estimate_gamma_median(Xtr_s); m3 = KernelRidge(kernel="rbf", alpha=1.0, gamma=g)
+            try: m3.fit(Xtr_s,ytr)
+            except TypeError: m3.fit(Xtr_s,ytr)
+            p3 = m3.predict(Xva_s); preds.append(p3); maes.append(mean_absolute_error(yva,p3)+1e-9)
+        ws = np.array([1.0/m for m in maes]); p = np.average(np.vstack(preds), axis=0, weights=ws)
+        oof[va]=p
+
+    # Reweight pass
+    w_all = tukey_weights(y - oof, c=ROBUST_C)
+    oof2 = np.zeros_like(y, dtype=float)
+    for tr, va in kf.split(X):
+        Xtr,Xva = X[tr],X[va]; ytr,yva = y[tr],y[va]; wtr=w_all[tr]
+        m1 = ExtraTreesRegressor(n_estimators=P["et_n2"], min_samples_leaf=2, random_state=seed, n_jobs=N_JOBS)
+        m2 = GradientBoostingRegressor(learning_rate=P["gbdt_lr2"], n_estimators=P["gbdt_n2"], max_depth=3, random_state=seed)
+        m1.fit(Xtr,ytr, sample_weight=wtr); m2.fit(Xtr,ytr, sample_weight=wtr)
+        p1 = m1.predict(Xva); p2 = m2.predict(Xva)
+        preds=[p1,p2]; maes=[mean_absolute_error(yva,p1)+1e-9, mean_absolute_error(yva,p2)+1e-9]
+        if use_krr and len(ytr) >= P["krr_min_n"]:
+            scaler = StandardScaler(); Xtr_s=scaler.fit_transform(Xtr); Xva_s=scaler.transform(Xva)
+            g = estimate_gamma_median(Xtr_s); m3 = KernelRidge(kernel="rbf", alpha=1.0, gamma=g)
+            try: m3.fit(Xtr_s,ytr, sample_weight=wtr)
+            except TypeError: m3.fit(Xtr_s,ytr)
+            p3 = m3.predict(Xva_s); preds.append(p3); maes.append(mean_absolute_error(yva,p3)+1e-9)
+        ws = np.array([1.0/m for m in maes]); p = np.average(np.vstack(preds), axis=0, weights=ws)
+        oof2[va]=p
+
+    # Final fit
+    m1 = ExtraTreesRegressor(n_estimators=P["et_nf"], min_samples_leaf=2, random_state=seed, n_jobs=N_JOBS)
+    m2 = GradientBoostingRegressor(learning_rate=P["gbdt_lr2"], n_estimators=P["gbdt_nf"], max_depth=3, random_state=seed)
+    m1.fit(X, y, sample_weight=w_all); m2.fit(X, y, sample_weight=w_all)
+    scaler=None; m3=None
+    if use_krr and len(y) >= P["krr_min_n"]:
+        scaler=StandardScaler(); Xs=scaler.fit_transform(X); g=estimate_gamma_median(Xs)
+        m3=KernelRidge(kernel="rbf", alpha=1.0, gamma=g)
+        try: m3.fit(Xs, y, sample_weight=w_all)
+        except TypeError: m3.fit(Xs, y)
+    ws_final = np.array([1.0, 1.0, 1.0 if (m3 is not None) else 0.0], dtype=float)
+    ensemble=(m1,m2,m3,scaler,ws_final)
+    mets=metrics(y, oof2)
+    return ensemble, oof2, mets, w_all
+
+def predict_ensemble(ens, X: np.ndarray) -> np.ndarray:
+    m1,m2,m3,scaler,ws = ens
+    preds=[m1.predict(X), m2.predict(X)]
+    if m3 is not None and scaler is not None: preds.append(m3.predict(scaler.transform(X)))
+    W=ws[:len(preds)]/(np.sum(ws[:len(preds)])+1e-12)
+    return (W[None,:] @ np.vstack(preds)).ravel()
+
+# ------------------------- OOD & anchors --------------------------
+def ood_nearest(train_smiles: List[str], test_smiles: List[str], train_names: List[str], thresh: float = 0.2):
+    sets_tr = [{s[i:i+3] for i in range(max(0,len(s)-2))} for s in train_smiles]
+    sims=[]; nearest=[]; flags=[]
+    for s in test_smiles:
+        s = s if isinstance(s,str) else ""
+        S={s[i:i+3] for i in range(max(0,len(s)-2))}
+        best,bj=0.0,-1
+        for j,T in enumerate(sets_tr):
+            u=len(S|T) or 1; inter=len(S & T); sim=inter/u
+            if sim>best: best=sim; bj=j
+        sims.append(float(best)); nearest.append(train_names[bj] if bj>=0 else None); flags.append(int(best<thresh))
+    return sims, nearest, flags
+
+def ood_nearest_fp(train_smiles: List[str], test_smiles: List[str], train_names: List[str],
+                   radius:int=FP_RADIUS, n_bits:int=FP_BITS, thresh: float = 0.2):
+    return _nearest_tanimoto_to_train(train_smiles, test_smiles, train_names,
+                                      n_bits=n_bits, radius=radius, thresh=thresh)
+
+def auto_select_anchors(df_mode, n_total=20, per_adduct_min=3, min_gap=ANCHORS_MIN_GAP) -> pd.DataFrame:
+    df = df_mode.dropna(subset=["rt"]).copy()
+    if len(df)==0: return df
+    n_total = min(n_total, max(8, int(np.ceil(len(df)*ANCHORS_MAX_FRAC))))
+    top_adducts = ["H","NH4","Na","K","Hloss","FA","AcO"]
+    df["adduct_std"] = df["adduct"].apply(lambda x: x if x in top_adducts else str(x))
+    counts = df["adduct_std"].value_counts(); total = counts.sum()
+    base = (counts/total*n_total).fillna(0.0)
+    alloc = np.maximum(np.floor(base).astype(int), per_adduct_min)
+    diff = n_total - int(alloc.sum())
+    if diff != 0:
+        order = (base - np.floor(base)).sort_values(ascending=(diff<0))
+        for k in order.index:
+            if diff>0: alloc[k]+=1; diff-=1
+            else:
+                if alloc[k]>per_adduct_min: alloc[k]-=1; diff+=1
+            if diff==0: break
+
+    def pick_stratified(dsub, n_target, min_gap):
+        d = dsub.sort_values(["rt", "compound_name"], kind="mergesort").reset_index(drop=True)
+        if len(d)<=n_target: return d
+        qs = np.linspace(0.03, 0.97, n_target)
+        targets = np.quantile(d["rt"].values, qs)
+        chosen=[]; used=np.zeros(len(d),bool)
+        for t in targets:
+            order = np.lexsort((d.index.values, np.abs(d["rt"].values - t)))
+            for j in order:
+                if used[j]: continue
+                ok=True
+                for k in chosen:
+                    if abs(d.loc[j,"rt"]-d.loc[k,"rt"])<min_gap: ok=False; break
+                if ok: chosen.append(j); used[j]=True; break
+        return d.loc[sorted(set(chosen))].copy()
+
+    chosen=[]
+    for adg, n_take in alloc.items():
+        sub = df[df["adduct_std"]==adg]
+        if len(sub) == 0: continue
+        chosen.append(pick_stratified(sub, int(n_take), min_gap))
+
+    out = pd.concat(chosen, axis=0, ignore_index=True) if chosen else pd.DataFrame(columns=df.columns)
+    if len(out)>n_total:
+        out = pick_stratified(out, n_total, min_gap)
+    return out
+
+def choose_space_and_build_mapper(tr_df, oof, label_series, anchors_df=None, spearman_cutoff=0.78):
+    cal_oof, _ = isotonic_fit_apply(oof, label_series.to_numpy(float), oof)
+    if anchors_df is None or len(anchors_df)==0:
+        anchors_df = pd.DataFrame(columns=tr_df.columns)
+    tr_local = tr_df[["compound_name","rt"]].copy()
+    tr_local["pred"] = cal_oof
+    tr_local["is_anchor"] = tr_local["compound_name"].isin(anchors_df.get("compound_name", pd.Series([],dtype=object))).astype(int)
+    mapped = map_pred_to_rt_safe(tr_local, cal_oof, spearman_cutoff)
+    mets = metrics(tr_local["rt"].to_numpy(float), mapped)
+    resid = tr_local["rt"].to_numpy(float) - mapped
+    q80 = float(np.quantile(np.abs(resid), 0.80)) if len(resid)>0 else 0.5
+    q95 = float(np.quantile(np.abs(resid), 0.95)) if len(resid)>0 else 1.0
+    return tr_local, q80, q95, mets
+
+# --------------------------- Stacking -----------------------------
+def _stack_features(p_rt: np.ndarray, p_k: np.ndarray) -> np.ndarray:
+     avg  = 0.5*(p_rt + p_k)
+     diff = p_rt - p_k
+     prod = p_rt * p_k
+     return np.vstack([p_rt, p_k, avg, diff, prod, np.abs(diff), p_rt**2, p_k**2]).T.astype(float)
+
+def fit_stacker_oof(y_true: np.ndarray, oof_rt_mapped: np.ndarray, oof_k_mapped: np.ndarray,
+                    seed: int = SEED, alpha_ridge: float = 0.3) -> Tuple[np.ndarray, Any]:
+    X_all = _stack_features(oof_rt_mapped, oof_k_mapped)
+    kf = KFold(n_splits=5 if len(y_true)>=25 else 4, shuffle=True, random_state=seed)
+    oof_stack = np.zeros_like(y_true, dtype=float)
+    for tr, va in kf.split(X_all):
+        Xtr, Xva = X_all[tr], X_all[va]; ytr, yva = y_true[tr], y_true[va]
+        base = 0.5*(Xtr[:,0] + Xtr[:,1]); w = tukey_weights(ytr - base, c=ROBUST_C)
+        try:
+            mdl = LinearRegression(positive=True); mdl.fit(Xtr, ytr, sample_weight=w)
+        except Exception:
+            mdl = Ridge(alpha=alpha_ridge, fit_intercept=True, random_state=seed); mdl.fit(Xtr, ytr, sample_weight=w)
+        oof_stack[va] = mdl.predict(Xva)
+    try:
+        final_model = LinearRegression(positive=True); final_model.fit(X_all, y_true)
+    except Exception:
+        final_model = Ridge(alpha=alpha_ridge, fit_intercept=True, random_state=seed); final_model.fit(X_all, y_true)
+    return oof_stack, final_model
+
+SELECTION_EPS = 0.01
+TIE_BREAK = ["stack","k","rt"]
+def _pick_winner(scores: dict, last_path: str, eps: float = SELECTION_EPS,
+                 tie_break = ("stack","k","rt")) -> str:
+    best_now = sorted(scores.items(), key=lambda kv: (round(kv[1], 6),
+                          -tie_break.index(kv[0]) if kv[0] in tie_break else 0))[-1][0]
+    try:
+        if os.path.exists(last_path):
+            last = json.load(open(last_path, "r", encoding="utf-8"))
+            lw = last.get("winner"); ls = last.get("scores", {}).get(lw, None)
+            if lw in scores and ls is not None and scores[best_now] < ls + eps:
+                return lw
+    except Exception:
+        pass
+    try:
+        json.dump({"winner": best_now, "scores": scores},
+                  open(last_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return best_now
+
+def apply_stacker(model: Any, p_rt_mapped: np.ndarray, p_k_mapped: np.ndarray) -> np.ndarray:
+    X = _stack_features(p_rt_mapped, p_k_mapped); return model.predict(X)
+
+# ----------------------------- Main -------------------------------
+def normalize_t0_units(rt_series: pd.Series, t0_series: pd.Series) -> pd.Series:
+    t0 = pd.to_numeric(t0_series, errors="coerce").copy()
+    rt = pd.to_numeric(rt_series, errors="coerce")
+    med_rt = np.nanmedian(rt); med_t0 = np.nanmedian(t0)
+    if not np.isfinite(med_rt) or not np.isfinite(med_t0) or med_t0 <= 0:
+        return t0
+    if med_t0 > med_rt and (med_t0/60.0) < med_rt*0.8:  # seconds -> minutes
+        return t0 / 60.0
+    if (med_rt / med_t0) > 200:  # hours -> minutes
+        return t0 * 60.0
+    return t0
+
+def run(inhouse_path: str, theoretical_path: str, outdir: str,
+        anchors_user: Optional[str]=None,
+        min_group_n: Optional[int]=None,
+        use_fp: Optional[int]=None,
+        fp_bits: Optional[int]=None,
+        fp_radius: Optional[int]=None,
+        fp_svd: Optional[int]=None,
+        use_rd_1d2d: Optional[int]=None,
+        use_rd_3d: Optional[int]=None):
+
+    T0,_=tic("total")
+    if min_group_n is None: min_group_n = MIN_GROUP_N
+    if use_fp is None: use_fp = USE_FP
+    if fp_bits is None: fp_bits = FP_BITS
+    if fp_radius is None: fp_radius = FP_RADIUS
+    if fp_svd is None: fp_svd = FP_SVD
+    if use_rd_1d2d is None: use_rd_1d2d = USE_RD_1D2D
+    if use_rd_3d is None: use_rd_3d = USE_RD_3D
+
+    if not HAS_RDKIT and (use_rd_1d2d or use_rd_3d):
+        print("[WARN] RDKit unavailable: 1D/2D/3D descriptors have been disabled automatically.")
+        use_rd_1d2d = 0; use_rd_3d = 0
+
+    makedirs(outdir)
+    art_dir = makedirs(os.path.join(outdir, "artifacts"))
+
+    tr_raw=normalize_cols(read_csv_any(inhouse_path))
+    te_raw=normalize_cols(read_csv_any(theoretical_path))
+
+    # column mapping
+    name_tr = pick(tr_raw, ["compound_name","name","compound","analyte","analyte_name","standard_name"]) or "compound_name"
+    name_te = pick(te_raw, ["compound_name","name","compound","analyte","analyte_name","standard_name"]) or "compound_name"
+    smi_tr  = pick(tr_raw, ["smiles"]) or "smiles"
+    smi_te  = pick(te_raw, ["smiles"]) or "smiles"
+    rt_tr   = pick(tr_raw, ["rt","retention_time","rt_min","rt_minutes","retention_time_min"]) or "rt"
+    mode_tr = pick(tr_raw, ["ion_mode","polarity","mode"]) or "ion_mode"
+    mode_te = pick(te_raw, ["ion_mode","polarity","mode"]) or "ion_mode"
+    add_tr  = pick(tr_raw, ["adduct","precursor_ion","precursor","ion"]) or "adduct"
+    add_te  = pick(te_raw, ["adduct","precursor_ion","precursor","ion"]) or "adduct"
+    t0_tr   = pick(tr_raw, ["t0","t_zero","void_time","dead_time","t0_min"])
+
+    train = pd.DataFrame({
+        "compound_name": tr_raw[name_tr],
+        "smiles": tr_raw[smi_tr],
+        "rt": pd.to_numeric(tr_raw[rt_tr], errors="coerce"),
+        "ion_mode": tr_raw[mode_tr].map(unify_mode) if mode_tr in tr_raw.columns else "POS",
+        "adduct": tr_raw[add_tr].map(std_adduct) if add_tr in tr_raw.columns else "UNK",
+        "t0": pd.to_numeric(tr_raw[t0_tr], errors="coerce") if t0_tr in tr_raw.columns else np.nan
+    }).dropna(subset=["compound_name","smiles","rt"]).reset_index(drop=True)
+
+    test = pd.DataFrame({
+        "compound_name": te_raw[name_te],
+        "smiles": te_raw[smi_te],
+        "ion_mode": te_raw[mode_te].map(unify_mode) if mode_te in te_raw.columns else "POS",
+        "adduct": te_raw[add_te].map(std_adduct) if add_te in te_raw.columns else "UNK",
+    }).dropna(subset=["compound_name","smiles"]).reset_index(drop=True)
+
+    print("[DATA CHECK] mode counts (train):", dict(train["ion_mode"].value_counts().sort_index()))
+    print("[DATA CHECK] mode counts (test):", dict(test["ion_mode"].value_counts().sort_index()))
+
+    # user anchors
+    usr_anc_pos, usr_anc_neg = set(), set()
+    if anchors_user and os.path.exists(anchors_user):
+        if os.path.isdir(anchors_user):
+            for p in os.listdir(anchors_user):
+                q=os.path.join(anchors_user,p)
+                if p.lower().endswith("pos.txt"):
+                    usr_anc_pos |= set(x.strip() for x in open(q,encoding="utf-8").read().splitlines() if x.strip())
+                if p.lower().endswith("neg.txt"):
+                    usr_anc_neg |= set(x.strip() for x in open(q,encoding="utf-8").read().splitlines() if x.strip())
+        else:
+            try:
+                anc = normalize_cols(read_csv_any(anchors_user))
+                if "compound_name" in anc.columns:
+                    if "ion_mode" in anc.columns:
+                        usr_anc_pos |= set(anc.loc[anc["ion_mode"].map(unify_mode)=="POS","compound_name"].astype(str))
+                        usr_anc_neg |= set(anc.loc[anc["ion_mode"].map(unify_mode)=="NEG","compound_name"].astype(str))
+                    else:
+                        usr = set(anc["compound_name"].astype(str))
+                        usr_anc_pos |= usr; usr_anc_neg |= usr
+            except Exception:
+                usr = set(x.strip() for x in open(anchors_user,encoding="utf-8").read().splitlines() if x.strip())
+                usr_anc_pos |= usr; usr_anc_neg |= usr
+
+    # ========= train RT model (merged) =========
+    tr_rt = train.copy(); tr_rt["target"] = pd.to_numeric(tr_rt["rt"], errors="coerce")
+    tr_rt = tr_rt.loc[tr_rt["target"].notna()].reset_index(drop=True)
+
+    schema_rt_path = os.path.join(art_dir, "schema_rt.pkl")
+    if FREEZE_SCHEMA and os.path.exists(schema_rt_path):
+        sch = load_schema(schema_rt_path)
+        Xtr_rt = features_from_schema(tr_rt, sch, use_fp, fp_bits, fp_radius, fp_svd,
+                                      USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+        Xte_rt = features_from_schema(test, sch, use_fp, fp_bits, fp_radius, fp_svd,
+                                      USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+    else:
+        enc_rt, Xtr_rt, Xte_rt, keep_rt, means_rt = build_feature_matrices(
+            tr_rt, test, use_fp, fp_bits, fp_radius, fp_svd,
+            USE_RD_1D2D, USE_RD_3D, outdir=outdir
+        )
+        save_schema(schema_rt_path, enc_rt, keep_rt, means_rt)
+
+    n_splits_rt = 5 if len(tr_rt) >= 25 else 4
+    ens_rt, oof_rt, mets_rt_global, _ = train_cv_ensemble_robust(
+        Xtr_rt, tr_rt["target"].to_numpy(float), n_splits=n_splits_rt, seed=SEED, use_krr=bool(USE_KRR)
+    )
+
+    # ========= train k model (merged; t0 normalized) =========
+    has_t0 = train["t0"].notna().mean() >= K_COVERAGE_THRESH
+    ens_k=None; oof_k=None; tr_k=None; Xte_k=None
+    if has_t0:
+        t0_norm = normalize_t0_units(train["rt"], train["t0"])
+        def calc_k(rt, t0):
+            if pd.isna(rt) or pd.isna(t0) or t0 <= 0 or rt <= t0: return np.nan
+            return (rt - t0) / t0
+        tr_k = train.copy()
+        tr_k["target"] = [calc_k(r, t) for r, t in zip(tr_k["rt"], t0_norm)]
+        tr_k["target"] = winsorize_series(tr_k["target"], 0.02, 0.98)
+        tr_k = tr_k.loc[tr_k["target"].notna()].reset_index(drop=True)
+        if len(tr_k) >= 12:
+            schema_k_path = os.path.join(art_dir, "schema_k.pkl")
+            if FREEZE_SCHEMA and os.path.exists(schema_k_path):
+                sch_k = load_schema(schema_k_path)
+                Xtr_k = features_from_schema(tr_k, sch_k, use_fp, fp_bits, fp_radius, fp_svd,
+                                             USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+                Xte_k = features_from_schema(test, sch_k, use_fp, fp_bits, fp_radius, fp_svd,
+                                             USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+            else:
+                enc_k, Xtr_k, Xte_k, keep_k, means_k = build_feature_matrices(
+                    tr_k, test, use_fp, fp_bits, fp_radius, fp_svd,
+                    USE_RD_1D2D, USE_RD_3D, outdir=outdir
+                )
+                save_schema(schema_k_path, enc_k, keep_k, means_k)
+
+            n_splits_k = 5 if len(tr_k) >= 25 else 4
+            ens_k, oof_k, mets_k_global, _ = train_cv_ensemble_robust(
+                Xtr_k, tr_k["target"].to_numpy(float), n_splits=n_splits_k, seed=SEED, use_krr=bool(USE_KRR)
+            )
+
+    # === persist ensembles and OOF for reproducibility/plots ===
+    try:
+        with open(os.path.join(art_dir, "ensemble_rt.pkl"), "wb") as f:
+            pickle.dump(ens_rt, f)
+        if ens_k is not None:
+            with open(os.path.join(art_dir, "ensemble_k.pkl"), "wb") as f:
+                pickle.dump(ens_k, f)
+
+        oof_pkg = {"oof_rt_raw": np.asarray(oof_rt, float)}
+        if 'oof_k' in locals() and oof_k is not None:
+            oof_pkg["oof_k_raw"] = np.asarray(oof_k, float)
+        with open(os.path.join(art_dir, "oof_raw.pkl"), "wb") as f:
+            pickle.dump(oof_pkg, f)
+    except Exception as e:
+        print("[WARN] saving artifacts failed:", e)
+
+    # ========= calibration & prediction =========
+    all_preds = []; summary_rows = []; anchors_written = {"POS":[], "NEG":[]}
+
+    if CALIBRATION_SCOPE.lower()=="global":
+        auto_global = auto_select_anchors(tr_rt, n_total=min(max(12, int(np.ceil(len(tr_rt)*ANCHORS_MAX_FRAC*2))), 60),
+                                          per_adduct_min=3, min_gap=ANCHORS_MIN_GAP)
+        use_k_global = False
+        tr_rt_local, q80_rt, q95_rt, mets_rt = choose_space_and_build_mapper(tr_rt, oof_rt, tr_rt["rt"],
+                                                                             anchors_df=auto_global, spearman_cutoff=0.78)
+        mets_k = None; q80_k=q95_k=None; tr_k_local=None
+        if (ens_k is not None) and (tr_k is not None) and (oof_k is not None):
+            tr_k_local, q80_k, q95_k, mets_k = choose_space_and_build_mapper(tr_k, oof_k, tr_k["target"],
+                                                                             anchors_df=auto_global, spearman_cutoff=0.78)
+            if   CHOSEN_SPACE_GLOBAL.lower()=="k":    use_k_global = True
+            elif CHOSEN_SPACE_GLOBAL.lower()=="auto": use_k_global = (mets_k["R2"] >= mets_rt["R2"] - 1e-3)
+            else:                                     use_k_global = False
+
+        chosen = "k" if use_k_global else "rt"
+        if chosen == "k":
+            anchors_written["POS"] = tr_k_local.loc[tr_k_local["is_anchor"]==1,"compound_name"].astype(str).tolist()
+            anchors_written["NEG"] = anchors_written["POS"]
+            q80, q95, met = q80_k, q95_k, mets_k
+            p_base = predict_ensemble(ens_k, Xte_k)
+            _, pred_cal = isotonic_fit_apply(oof_k, tr_k["target"].to_numpy(float), p_base)
+            rt_final_all = map_pred_to_rt_safe(tr_k_local, pred_cal, 0.78)
+            base_tr_for_groups = tr_k; oof_all_for_groups = oof_k
+        else:
+            anchors_written["POS"] = tr_rt_local.loc[tr_rt_local["is_anchor"]==1,"compound_name"].astype(str).tolist()
+            anchors_written["NEG"] = anchors_written["POS"]
+            q80, q95, met = q80_rt, q95_rt, mets_rt
+            p_base = predict_ensemble(ens_rt, Xte_rt)
+            _, pred_cal = isotonic_fit_apply(oof_rt, tr_rt["rt"].to_numpy(float), p_base)
+            rt_final_all = map_pred_to_rt_safe(tr_rt_local, pred_cal, 0.78)
+            base_tr_for_groups = tr_rt; oof_all_for_groups = oof_rt
+
+        out_all = test[["compound_name","smiles","ion_mode","adduct"]].copy()
+        out_all["rt_pred"] = np.clip(rt_final_all, 0.01, None)
+        out_all["rt_lo80"] = np.clip(out_all["rt_pred"] - q80, 0.01, None)
+        out_all["rt_hi80"] = out_all["rt_pred"] + q80
+        out_all["rt_lo95"] = np.clip(out_all["rt_pred"] - q95, 0.01, None)
+        out_all["rt_hi95"] = out_all["rt_pred"] + q95
+
+        # —— 新增：保存理论集为新文件名 ——
+        safe_to_csv(out_all.sort_values(["ion_mode", "rt_pred"]),
+                    os.path.join(outdir, "predicted_rt_theory.csv"), index=False)
+
+        # —— 新增：构造并保存 inhouse 预测（使用同一映射） ——
+        tr_local_used = tr_k_local if (locals().get("chosen", "rt") == "k") else tr_rt_local
+        rt_pred_inhouse = map_pred_to_rt_safe(tr_local_used, tr_local_used["pred"].to_numpy(float), 0.78)
+
+        inhouse_all = train[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+        inhouse_all["rt_pred"] = np.clip(rt_pred_inhouse, 0.01, None)
+        inhouse_all["rt_lo80"] = np.clip(inhouse_all["rt_pred"] - q80, 0.01, None)
+        inhouse_all["rt_hi80"] = inhouse_all["rt_pred"] + q80
+        inhouse_all["rt_lo95"] = np.clip(inhouse_all["rt_pred"] - q95, 0.01, None)
+        inhouse_all["rt_hi95"] = inhouse_all["rt_pred"] + q95
+
+        # 与 theory 表头对齐的占位列
+        inhouse_all["OOD_flag"] = 0
+        inhouse_all["nearest_sim"] = np.nan
+        inhouse_all["nearest_train"] = np.nan
+        inhouse_all["nearest_sim_fp"] = np.nan
+        inhouse_all["nearest_train_fp"] = np.nan
+        inhouse_all["OOD_flag_FP"] = 0
+
+        safe_to_csv(inhouse_all.sort_values(["ion_mode", "rt_pred"]),
+                    os.path.join(outdir, "predicted_rt_inhouse.csv"), index=False)
+
+        sims, nearest, flags = ood_nearest(train["smiles"].astype(str).tolist(),
+                                           test["smiles"].astype(str).tolist(),
+                                           train["compound_name"].astype(str).tolist(), thresh=0.2)
+        out_all["OOD_flag"]=flags; out_all["nearest_sim"]=sims; out_all["nearest_train"]=nearest
+
+        if MIN_GROUP_N >= 2:
+            for adg, tr_g in base_tr_for_groups.groupby("adduct"):
+                if len(tr_g) < MIN_GROUP_N: continue
+                mask_tr = (base_tr_for_groups["adduct"] == adg).to_numpy()
+                oof_g   = oof_all_for_groups[mask_tr]
+                y_g     = (tr_k["target"] if chosen=="k" else tr_rt["rt"])[mask_tr].to_numpy(float)
+                cal_oof_g, _ = isotonic_fit_apply(oof_g, y_g, oof_g)
+                tr_local_g = tr_g[["compound_name","rt"]].copy()
+                tr_local_g["pred"] = cal_oof_g; tr_local_g["is_anchor"] = 0
+                mask_te = (out_all["adduct"]==adg)
+                if mask_te.any():
+                    te_idx_adg = test[(test["adduct"]==adg)].index.values
+                    p_base_adg = predict_ensemble(ens_k, Xte_k[te_idx_adg]) if chosen=="k" else predict_ensemble(ens_rt, Xte_rt[te_idx_adg])
+                    _, pred_cal_adg = isotonic_fit_apply(oof_g, y_g, p_base_adg)
+                    rt_adg = map_pred_to_rt_safe(tr_local_g, pred_cal_adg, 0.78)
+                    out_all.loc[mask_te, "rt_pred"] = np.clip(rt_adg, 0.01, None)
+
+        all_preds.append(out_all)
+        summary_rows.append({"mode":"GLOBAL", **met, "q80_abs_err":q80, "q95_abs_err":q95,
+                             "anchors_used": int((tr_k_local if chosen=='k' else tr_rt_local)["is_anchor"].sum()),
+                             "n_train": int(len(base_tr_for_groups)), "n_test": int(len(test)),
+                             "cov_at_q80": cov80, "cov_at_q95": cov95,
+                             "target_space": chosen})
+
+        try:
+            if chosen == "k":
+                oof_map = map_pred_to_rt_safe(tr_k_local, tr_k_local["pred"].to_numpy(float), 0.78)
+                base_df = tr_k
+            else:
+                oof_map = map_pred_to_rt_safe(tr_rt_local, tr_rt_local["pred"].to_numpy(float), 0.78)
+                base_df = tr_rt
+            oof_df_global = base_df[["compound_name", "smiles", "ion_mode", "adduct", "rt"]].copy()
+            oof_df_global.rename(columns={"rt": "rt_true"}, inplace=True)
+            oof_df_global["rt_oof_mapped"] = oof_map
+            oof_df_global["resid"] = oof_df_global["rt_true"] - oof_df_global["rt_oof_mapped"]
+
+            if MAKE_PLOTS:
+                figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                _save_parity_scatter(oof_df_global, os.path.join(figdir, f"parity_GLOBAL.{PLOTS_FMT}"), "GLOBAL")
+                _save_abs_error_hist(oof_df_global, os.path.join(figdir, f"abs_error_GLOBAL.{PLOTS_FMT}"), "GLOBAL")
+                _save_calibration_curve(oof_df_global, os.path.join(figdir, f"calibration_GLOBAL.{PLOTS_FMT}"),
+                                        "GLOBAL")
+                _save_error_vs_ood(oof_df_global, os.path.join(figdir, f"error_vs_ood_GLOBAL.{PLOTS_FMT}"), "GLOBAL")
+                _save_ecdf_abs_error(oof_df_global, os.path.join(figdir, f"ecdf_GLOBAL.{PLOTS_FMT}"), "GLOBAL")
+                _save_error_vs_tanimoto(oof_df_global, os.path.join(figdir, f"error_vs_tanimoto_GLOBAL.{PLOTS_FMT}"),
+                                        "GLOBAL")
+                _save_box_err_by_adduct(oof_df_global, os.path.join(figdir, f"box_by_adduct_GLOBAL.{PLOTS_FMT}"),
+                                        "GLOBAL")
+
+                X_global = Xtr_rt
+                w_df_g, h_star_g = _compute_williams(X_global, oof_df_global["rt_true"].to_numpy(float),
+                                                     oof_df_global["rt_oof_mapped"].to_numpy(float))
+                if len(w_df_g) > 0:
+                    anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                    safe_to_csv(w_df_g, os.path.join(anadir, f"williams_GLOBAL.csv"), index=False)
+                    _save_williams_plot(w_df_g, h_star_g, os.path.join(figdir, f"williams_GLOBAL.{PLOTS_FMT}"),
+                                        "GLOBAL | Williams")
+                _save_pi_calibration_curve_kfold(oof_df_global,
+                                                 os.path.join(figdir, f"pi_calibration_GLOBAL.{PLOTS_FMT}"))
+
+            extras_global = compute_extras_from_oof(oof_df_global)
+            summary_rows[-1].update(extras_global)
+        except Exception as _e:
+            pass
+
+        safe_to_csv(pd.DataFrame([summary_rows[-1]]), os.path.join(outdir, "metrics_GLOBAL.csv"), index=False)
+
+
+    else:
+        # ------ per-mode calibration ------
+        for mode in ("POS","NEG"):
+            sp_cut = SPEARMAN_CUTOFF_POS if mode=="POS" else SPEARMAN_CUTOFF_NEG
+            n_anchors = ANCHORS_N_POS if mode=="POS" else ANCHORS_N_NEG
+            per_adduct_min = 5 if mode=="POS" else 3
+            min_gap_mode = MIN_GAP_POS if mode=="POS" else MIN_GAP_NEG
+
+            # RT branch
+            tr_m_rt = tr_rt[tr_rt["ion_mode"]==mode].reset_index(drop=True)
+            mets_rt_mode = {"R2": -1e9}; tr_local_rt=None; cal_oof_rt_m=None
+            if len(tr_m_rt) >= 8:
+                idx_m_rt = tr_rt[tr_rt["ion_mode"]==mode].index.values
+                oof_rt_m = oof_rt[idx_m_rt]
+                cal_oof_rt_m, _ = isotonic_fit_apply(oof_rt_m, tr_m_rt["rt"].to_numpy(float), oof_rt_m)
+                if mode=="POS" and len(usr_anc_pos)>0:
+                    anc_rt = tr_m_rt[tr_m_rt["compound_name"].astype(str).isin(usr_anc_pos)].copy()
+                elif mode=="NEG" and len(usr_anc_neg)>0:
+                    anc_rt = tr_m_rt[tr_m_rt["compound_name"].astype(str).isin(usr_anc_neg)].copy()
+                else:
+                    anc_rt = pd.DataFrame(columns=tr_m_rt.columns)
+                auto_rt = auto_select_anchors(tr_m_rt, n_total=n_anchors, per_adduct_min=per_adduct_min, min_gap=min_gap_mode)
+                parts=[];
+                if len(anc_rt)>0: parts.append(anc_rt)
+                if auto_rt is not None and len(auto_rt)>0: parts.append(auto_rt)
+                anc_rt = pd.concat(parts, ignore_index=True).drop_duplicates("compound_name") if len(parts)>0 else pd.DataFrame(columns=tr_m_rt.columns)
+                cap = min(n_anchors, max(8, int(np.ceil(len(tr_m_rt)*ANCHORS_MAX_FRAC))))
+                if len(anc_rt) > cap:
+                    keep_idx = np.linspace(0, len(anc_rt)-1, cap).astype(int)
+                    anc_rt = anc_rt.sort_values("rt").iloc[keep_idx].copy()
+
+                tr_local_rt = tr_m_rt[["compound_name","rt"]].copy()
+                tr_local_rt["pred"] = cal_oof_rt_m
+                tr_local_rt["is_anchor"] = tr_local_rt["compound_name"].isin(anc_rt["compound_name"]).astype(int)
+                mapped_rt_oof_rt = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                mets_rt_mode = metrics(tr_local_rt["rt"].to_numpy(float), mapped_rt_oof_rt)
+
+            # k branch
+            mets_k_mode = {"R2": -1e9}; tr_local_k=None; cal_oof_k_m=None; tr_m_k=None
+            have_k = (ens_k is not None) and (tr_k is not None) and (oof_k is not None)
+            if have_k:
+                tr_m_k = tr_k[tr_k["ion_mode"]==mode].reset_index(drop=True)
+                if len(tr_m_k) >= 8:
+                    idx_m_k = tr_k[tr_k["ion_mode"]==mode].index.values
+                    oof_k_m = oof_k[idx_m_k]
+                    cal_oof_k_m, _ = isotonic_fit_apply(oof_k_m, tr_m_k["target"].to_numpy(float), oof_k_m)
+                    if mode=="POS" and len(usr_anc_pos)>0:
+                        anc_k = tr_m_k[tr_m_k["compound_name"].astype(str).isin(usr_anc_pos)].copy()
+                    elif mode=="NEG" and len(usr_anc_neg)>0:
+                        anc_k = tr_m_k[tr_m_k["compound_name"].astype(str).isin(usr_anc_neg)].copy()
+                    else:
+                        anc_k = pd.DataFrame(columns=tr_m_k.columns)
+                    auto_k = auto_select_anchors(tr_m_k, n_total=n_anchors, per_adduct_min=per_adduct_min, min_gap=min_gap_mode)
+                    parts=[]
+                    if len(anc_k)>0: parts.append(anc_k)
+                    if auto_k is not None and len(auto_k)>0: parts.append(auto_k)
+                    anc_k = pd.concat(parts, ignore_index=True).drop_duplicates("compound_name") if len(parts)>0 else pd.DataFrame(columns=tr_m_k.columns)
+                    cap = min(n_anchors, max(8, int(np.ceil(len(tr_m_k)*ANCHORS_MAX_FRAC))))
+                    if len(anc_k) > cap:
+                        keep_idx = np.linspace(0, len(anc_k)-1, cap).astype(int)
+                        anc_k = anc_k.sort_values("rt").iloc[keep_idx].copy()
+
+                    tr_local_k = tr_m_k[["compound_name","rt"]].copy()
+                    tr_local_k["pred"] = cal_oof_k_m
+                    tr_local_k["is_anchor"] = tr_local_k["compound_name"].isin(anc_k["compound_name"]).astype(int)
+                    mapped_rt_oof_k = map_pred_to_rt_safe(tr_local_k, cal_oof_k_m, sp_cut)
+                    mets_k_mode = metrics(tr_local_k["rt"].to_numpy(float), mapped_rt_oof_k)
+
+            # Stacking
+            used_stack = False
+            if USE_STACKING and (tr_local_rt is not None) and (tr_local_k is not None):
+                mapped_rt_oof_rt_safe = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                mapped_rt_oof_k_safe  = map_pred_to_rt_safe(tr_local_k,  cal_oof_k_m,  sp_cut)
+                y_train_rt = tr_m_rt["rt"].to_numpy(float)
+                oof_stack, stacker = fit_stacker_oof(y_train_rt, mapped_rt_oof_rt_safe, mapped_rt_oof_k_safe)
+                anc_union = set(tr_local_rt.loc[tr_local_rt["is_anchor"]==1,"compound_name"].astype(str)) \
+                            | set(tr_local_k .loc[tr_local_k ["is_anchor"]==1,"compound_name"].astype(str))
+                tr_local_stack = tr_m_rt[["compound_name","rt"]].copy()
+                tr_local_stack["pred"] = oof_stack
+                tr_local_stack["is_anchor"] = tr_local_stack["compound_name"].astype(str).isin(anc_union).astype(int)
+                mapped_oof_stack = map_pred_to_rt_safe(tr_local_stack, oof_stack, sp_cut)
+                mets_stack = metrics(y_train_rt, mapped_oof_stack)
+                best_single = max(mets_rt_mode.get("R2",-1e9), mets_k_mode.get("R2",-1e9))
+
+                adopt_stack = False
+                if mode == "NEG":
+                    if have_k and (mets_k_mode.get("R2",-1e9) - mets_rt_mode.get("R2",-1e9)) >= 0.05:
+                        adopt_stack = False
+                    else:
+                        if (mets_stack["R2"] >= best_single - 1e-4) and (not have_k or mets_stack["R2"] >= mets_k_mode.get("R2",-1e9) - 1e-3):
+                            adopt_stack = True
+                else:
+                    if mets_stack["R2"] >= best_single - 5e-3:
+                        adopt_stack = True
+
+                if adopt_stack:
+                    resid_train = y_train_rt - mapped_oof_stack
+                    q80 = float(np.quantile(np.abs(resid_train), 0.80))
+                    q95 = float(np.quantile(np.abs(resid_train), 0.95))
+                    cov80 = float(np.mean(np.abs(resid_train) <= q80))
+                    cov95 = float(np.mean(np.abs(resid_train) <= q95))
+                    chosen = "stack"
+                    anchors_used = int(tr_local_stack["is_anchor"].sum())
+                    met = mets_stack
+                    used_stack = True
+
+                    te_idx = test[test["ion_mode"]==mode].index.values
+                    p_base_rt = predict_ensemble(ens_rt, Xte_rt[te_idx])
+                    _, pred_cal_rt = isotonic_fit_apply(oof_rt[tr_rt[tr_rt["ion_mode"]==mode].index.values],
+                                                        tr_m_rt["rt"].to_numpy(float), p_base_rt)
+                    rt_test_from_rt = map_pred_to_rt_safe(tr_local_rt, pred_cal_rt, sp_cut)
+                    have_k2 = (ens_k is not None) and (tr_k is not None) and (oof_k is not None) and (Xte_k is not None)
+                    if have_k2:
+                        p_base_k = predict_ensemble(ens_k, Xte_k[te_idx])
+                        _, pred_cal_k = isotonic_fit_apply(oof_k[tr_k[tr_k["ion_mode"]==mode].index.values],
+                                                           tr_m_k["target"].to_numpy(float), p_base_k)
+                        rt_test_from_k = map_pred_to_rt_safe(tr_local_k, pred_cal_k, sp_cut)
+                    else:
+                        rt_test_from_k = rt_test_from_rt
+
+                    pred_stack_test = apply_stacker(stacker, rt_test_from_rt, rt_test_from_k)
+                    rt_final = map_pred_to_rt_safe(tr_local_stack, pred_stack_test, sp_cut)
+
+                    # === save OOF (stacked & mapped) for this mode ===
+                    try:
+                        oof_df = tr_m_rt[["compound_name", "smiles", "ion_mode", "adduct", "rt"]].copy()
+                        oof_df.rename(columns={"rt": "rt_true"}, inplace=True)
+                        oof_df["rt_oof_mapped"] = mapped_oof_stack
+                        oof_df["resid"] = oof_df["rt_true"] - oof_df["rt_oof_mapped"]
+                        safe_to_csv(oof_df, os.path.join(outdir, f"oof_{mode}.csv"), index=False)
+                    except Exception as e:
+                        print(f"[WARN] save OOF {mode} failed:", e)
+
+                    # === plots for this mode (stack route) ===
+                    if MAKE_PLOTS:
+                        figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                        base_title = f"{mode} | STACK"
+                        _save_parity_scatter(oof_df, os.path.join(figdir, f"parity_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_abs_error_hist(oof_df, os.path.join(figdir, f"abs_error_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_calibration_curve(oof_df, os.path.join(figdir, f"calibration_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+                        _save_error_vs_ood(oof_df, os.path.join(figdir, f"error_vs_ood_{mode}.{PLOTS_FMT}"), base_title)
+
+                        _save_ecdf_abs_error(oof_df, os.path.join(figdir, f"ecdf_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_error_vs_tanimoto(oof_df, os.path.join(figdir, f"error_vs_tanimoto_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+                        _save_box_err_by_adduct(oof_df, os.path.join(figdir, f"box_by_adduct_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+
+                        # Williams
+                        idx_m_rt = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                        X_mode = Xtr_rt[idx_m_rt]
+                        w_df, h_star = _compute_williams(X_mode, oof_df["rt_true"].to_numpy(float),
+                                                         oof_df["rt_oof_mapped"].to_numpy(float))
+                        if len(w_df) > 0:
+                            anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                            safe_to_csv(w_df, os.path.join(anadir, f"williams_{mode}.csv"), index=False)
+                            _save_williams_plot(w_df, h_star, os.path.join(figdir, f"williams_{mode}.{PLOTS_FMT}"),
+                                                f"{mode} | Williams")
+
+                        _save_pi_calibration_curve_kfold(oof_df,
+                                                         os.path.join(figdir, f"pi_calibration_{mode}.{PLOTS_FMT}"))
+
+                    te_m = test[test["ion_mode"]==mode].copy().reset_index(drop=True)
+                    out_mode = te_m[["compound_name","smiles","ion_mode","adduct"]].copy()
+                    out_mode["rt_pred"] = np.clip(rt_final, 0.01, None)
+                    out_mode["rt_lo80"] = np.clip(rt_final - q80, 0.01, None)
+                    out_mode["rt_hi80"] = rt_final + q80
+                    out_mode["rt_lo95"] = np.clip(rt_final - q95, 0.01, None)
+                    out_mode["rt_hi95"] = rt_final + q95
+
+                    # OOD flags
+                    sims, nearest, flags = ood_nearest(
+                        train["smiles"].astype(str).tolist(),
+                        te_m["smiles"].astype(str).tolist(),
+                        train["compound_name"].astype(str).tolist(), thresh=0.2
+                    )
+                    out_mode["OOD_flag"] = flags;
+                    out_mode["nearest_sim"] = sims;
+                    out_mode["nearest_train"] = nearest
+
+                    sims_fp, nearest_fp, flags_fp = ood_nearest_fp(
+                        train["smiles"].astype(str).tolist(),
+                        te_m["smiles"].astype(str).tolist(),
+                        train["compound_name"].astype(str).tolist(),
+                        radius=FP_RADIUS, n_bits=FP_BITS, thresh=0.2
+                    )
+                    out_mode["nearest_sim_fp"] = sims_fp
+                    out_mode["nearest_train_fp"] = nearest_fp
+                    out_mode["OOD_flag_FP"] = flags_fp
+
+                    if chosen == "stack":
+                        base_train_df = tr_m_rt
+                        base_oof_all = oof_stack
+                        pred_source = pred_stack_test
+                    elif chosen == "k":
+                        base_train_df = tr_m_k
+                        base_oof_all = cal_oof_k_m
+                        pred_source = pred_cal_k
+                    else:  # "rt"
+                        base_train_df = tr_m_rt
+                        base_oof_all = cal_oof_rt_m
+                        pred_source = pred_cal_rt
+
+                    for adg, tr_g in base_train_df.groupby("adduct"):
+                        if len(tr_g) < min_group_n:
+                            continue
+
+                        mask_tr = (base_train_df["adduct"] == adg).to_numpy()
+                        base_oof = base_oof_all[mask_tr]
+                        y_g = (tr_g["target"] if chosen == "k" else tr_g["rt"]).to_numpy(float)
+                        cal_oof_g, _ = isotonic_fit_apply(base_oof, y_g, base_oof)
+
+                        tr_local_g = tr_g[["compound_name", "rt"]].copy()
+                        tr_local_g["pred"] = cal_oof_g
+                        tr_local_g["is_anchor"] = 0
+
+                        mask_te = (out_mode["adduct"] == adg)
+                        if mask_te.any():
+                            pred_cal_adg = np.asarray(pred_source, float)[mask_te.values]
+                            rt_adg = map_pred_to_rt_safe(tr_local_g, pred_cal_adg, sp_cut)
+                            out_mode.loc[mask_te, "rt_pred"] = np.clip(rt_adg, 0.01, None)
+
+                    if MAKE_PLOTS:
+                        figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                        base_title = f"{mode} | {chosen.upper()}"
+                        _save_parity_scatter(oof_df, os.path.join(figdir, f"parity_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_abs_error_hist(oof_df, os.path.join(figdir, f"abs_error_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_calibration_curve(oof_df, os.path.join(figdir, f"calibration_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+                        _save_error_vs_ood(oof_df, os.path.join(figdir, f"error_vs_ood_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_ecdf_abs_error(oof_df, os.path.join(figdir, f"ecdf_{mode}.{PLOTS_FMT}"), base_title)
+                        _save_error_vs_tanimoto(oof_df, os.path.join(figdir, f"error_vs_tanimoto_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+                        _save_box_err_by_adduct(oof_df, os.path.join(figdir, f"box_by_adduct_{mode}.{PLOTS_FMT}"),
+                                                base_title)
+
+                        idx_m_rt = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                        X_mode = Xtr_rt[idx_m_rt]
+                        w_df, h_star = _compute_williams(X_mode,
+                                                         oof_df["rt_true"].to_numpy(float),
+                                                         oof_df["rt_oof_mapped"].to_numpy(float))
+                        if len(w_df) > 0:
+                            anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                            safe_to_csv(w_df, os.path.join(anadir, f"williams_{mode}.csv"), index=False)
+                            _save_williams_plot(w_df, h_star,
+                                                os.path.join(figdir, f"williams_{mode}.{PLOTS_FMT}"),
+                                                f"{mode} | Williams")
+
+                        _save_pi_calibration_curve_kfold(oof_df,
+                                                         os.path.join(figdir, f"pi_calibration_{mode}.{PLOTS_FMT}"))
+
+                    out_mode["rt_lo80"] = np.clip(out_mode["rt_pred"] - q80, 0.01, None)
+                    out_mode["rt_hi80"] = out_mode["rt_pred"] + q80
+                    out_mode["rt_lo95"] = np.clip(out_mode["rt_pred"] - q95, 0.01, None)
+                    out_mode["rt_hi95"] = out_mode["rt_pred"] + q95
+
+                    cov80, cov95 = compute_cov_from_oof(oof_df, q80, q95)
+                    extras_mode = compute_extras_from_oof(oof_df)
+                    if PRINT_PER_MODE_METRICS:
+                        print(f"\n=== [{mode}] (chosen={chosen}) Metrics (OOF, RT-space) ===")
+                        for k, v in met.items():
+                            print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+                        print(f"q80_abs_err: {q80:.3f} | q95_abs_err: {q95:.3f} | "
+                              f"cov80: {cov80:.3f} | cov95: {cov95:.3f} | anchors_used: {anchors_used}")
+
+                    safe_to_csv(
+                        pd.DataFrame([{"mode": mode, **met, **extras_mode,
+                                       "q80_abs_err": q80, "q95_abs_err": q95,
+                                       "cov80": cov80, "cov95": cov95,
+                                       "anchors_used": anchors_used,
+                                       "n_train": int(len(tr_m_rt)),
+                                       "n_test": int(len(te_m)),
+                                       "target_space": chosen}]),
+                        os.path.join(outdir, f"metrics_{mode}.csv"),
+                        index=False
+                    )
+
+                    summary_rows.append({"mode": mode, **met, "q80_abs_err": q80, "q95_abs_err": q95,
+                                         "anchors_used": anchors_used,
+                                         "n_train": int(len(tr_m_rt)),
+                                         "n_test": int(len(te_m)),
+                                         "target_space": chosen})
+                    all_preds.append(out_mode)
+
+                    # —— 新增：收集 inhouse（训练集）预测（已映射） ——
+                    inhouse_mode = oof_df[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+                    inhouse_mode["rt_pred"] = oof_df["rt_oof_mapped"].clip(lower=0.01)
+
+                    # 使用训练残差的 q80/q95 构造对称区间
+                    inhouse_mode["rt_lo80"] = np.clip(inhouse_mode["rt_pred"] - q80, 0.01, None)
+                    inhouse_mode["rt_hi80"] = inhouse_mode["rt_pred"] + q80
+                    inhouse_mode["rt_lo95"] = np.clip(inhouse_mode["rt_pred"] - q95, 0.01, None)
+                    inhouse_mode["rt_hi95"] = inhouse_mode["rt_pred"] + q95
+
+                    # 为了与 theory 表头对齐，占位 OOD/Fingerprint 相关列（inhouse 不做 OOD）
+                    inhouse_mode["OOD_flag"] = 0
+                    inhouse_mode["nearest_sim"] = np.nan
+                    inhouse_mode["nearest_train"] = np.nan
+                    inhouse_mode["nearest_sim_fp"] = np.nan
+                    inhouse_mode["nearest_train_fp"] = np.nan
+                    inhouse_mode["OOD_flag_FP"] = 0
+
+                    # 收集到列表，循环结束后统一写盘
+                    if 'inhouse_rows' not in locals():
+                        inhouse_rows = []
+                    inhouse_rows.append(inhouse_mode)
+
+            # if stacked path used, skip single-route logic
+            if used_stack:
+                continue
+
+                # choose rt vs k
+            use_k_for_mode = False
+            if have_k and mets_k_mode["R2"] > -1e8:
+                if mode == "NEG":
+                    use_k_for_mode = (mets_k_mode["R2"] - mets_rt_mode["R2"]) >= 0.05
+                else:
+                    use_k_for_mode = (mets_k_mode["R2"] >= max(0.40, mets_rt_mode["R2"] - 0.10))
+
+            if use_k_for_mode:
+                resid_train = tr_local_k["rt"].to_numpy(float) - map_pred_to_rt_safe(
+                    tr_local_k, tr_local_k["pred"].to_numpy(float), sp_cut)
+                q80 = float(np.quantile(np.abs(resid_train), 0.80))
+                q95 = float(np.quantile(np.abs(resid_train), 0.95))
+                cov80 = float(np.mean(np.abs(resid_train) <= q80))
+                cov95 = float(np.mean(np.abs(resid_train) <= q95))
+                chosen = "k"
+                anchors_used = int(tr_local_k["is_anchor"].sum())
+                anchors_written[mode] = tr_local_k.loc[tr_local_k["is_anchor"] == 1, "compound_name"].astype(
+                    str).tolist()
+                met = mets_k_mode
+            else:
+                resid_train = tr_local_rt["rt"].to_numpy(float) - map_pred_to_rt_safe(
+                    tr_local_rt, tr_local_rt["pred"].to_numpy(float), sp_cut)
+                q80 = float(np.quantile(np.abs(resid_train), 0.80))
+                q95 = float(np.quantile(np.abs(resid_train), 0.95))
+                chosen = "rt"
+                anchors_used = int(tr_local_rt["is_anchor"].sum())
+                anchors_written[mode] = tr_local_rt.loc[tr_local_rt["is_anchor"] == 1, "compound_name"].astype(
+                    str).tolist()
+                met = mets_rt_mode
+
+            te_m = test[test["ion_mode"] == mode].copy().reset_index(drop=True)
+            out_mode = te_m[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+
+            if chosen == "k":
+                te_idx = test[test["ion_mode"] == mode].index.values
+                p_base = predict_ensemble(ens_k, Xte_k[te_idx])
+                idx_fit = tr_k[tr_k["ion_mode"] == mode].index.values
+                oof_fit = oof_k[idx_fit];
+                y_fit = tr_m_k["target"].to_numpy(float)
+                _, pred_cal = isotonic_fit_apply(oof_fit, y_fit, p_base)
+                rt_final = map_pred_to_rt_safe(tr_local_k, pred_cal, sp_cut)
+            else:
+                te_idx = test[test["ion_mode"] == mode].index.values
+                p_base = predict_ensemble(ens_rt, Xte_rt[te_idx])
+                idx_fit = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                oof_fit = oof_rt[idx_fit];
+                y_fit = tr_m_rt["rt"].to_numpy(float)
+                _, pred_cal = isotonic_fit_apply(oof_fit, y_fit, p_base)
+                rt_final = map_pred_to_rt_safe(tr_local_rt, pred_cal, sp_cut)
+
+            # === save OOF (single-route mapped) for this mode ===
+            try:
+                if chosen == "k":
+                    mapped_oof = map_pred_to_rt_safe(tr_local_k, cal_oof_k_m, sp_cut)
+                    base_df = tr_m_k
+                else:
+                    mapped_oof = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                    base_df = tr_m_rt
+                oof_df = base_df[["compound_name", "smiles", "ion_mode", "adduct", "rt"]].copy()
+                oof_df.rename(columns={"rt": "rt_true"}, inplace=True)
+                oof_df["rt_oof_mapped"] = mapped_oof
+                oof_df["resid"] = oof_df["rt_true"] - oof_df["rt_oof_mapped"]
+                safe_to_csv(oof_df, os.path.join(outdir, f"oof_{mode}.csv"), index=False)
+            except Exception as e:
+                print(f"[WARN] save OOF {mode} failed:", e)
+
+            out_mode["rt_pred"] = np.clip(rt_final, 0.01, None)
+            out_mode["rt_lo80"] = np.clip(rt_final - q80, 0.01, None)
+            out_mode["rt_hi80"] = rt_final + q80
+            out_mode["rt_lo95"] = np.clip(rt_final - q95, 0.01, None)
+            out_mode["rt_hi95"] = rt_final + q95
+
+            sims, nearest, flags = ood_nearest(
+                train["smiles"].astype(str).tolist(),
+                te_m["smiles"].astype(str).tolist(),
+                train["compound_name"].astype(str).tolist(), thresh=0.2
+            )
+            out_mode["OOD_flag"] = flags;
+            out_mode["nearest_sim"] = sims;
+            out_mode["nearest_train"] = nearest
+
+            # === plots for this mode (single route) ===
+            if MAKE_PLOTS:
+                figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                base_title = f"{mode} | {chosen.upper()}"
+                _save_parity_scatter(oof_df, os.path.join(figdir, f"parity_{mode}.{PLOTS_FMT}"), base_title)
+                _save_abs_error_hist(oof_df, os.path.join(figdir, f"abs_error_{mode}.{PLOTS_FMT}"), base_title)
+                _save_calibration_curve(oof_df, os.path.join(figdir, f"calibration_{mode}.{PLOTS_FMT}"), base_title)
+                _save_error_vs_ood(oof_df, os.path.join(figdir, f"error_vs_ood_{mode}.{PLOTS_FMT}"), base_title)
+                _save_ecdf_abs_error(oof_df, os.path.join(figdir, f"ecdf_{mode}.{PLOTS_FMT}"), base_title)
+                _save_error_vs_tanimoto(oof_df, os.path.join(figdir, f"error_vs_tanimoto_{mode}.{PLOTS_FMT}"),
+                                        base_title)
+                _save_box_err_by_adduct(oof_df, os.path.join(figdir, f"box_by_adduct_{mode}.{PLOTS_FMT}"), base_title)
+
+                # Williams
+                idx_m_rt = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                X_mode = Xtr_k[tr_k[tr_k["ion_mode"] == mode].index.values] if (
+                            chosen == "k" and Xte_k is not None) else Xtr_rt[idx_m_rt]
+                w_df, h_star = _compute_williams(X_mode, oof_df["rt_true"].to_numpy(float),
+                                                 oof_df["rt_oof_mapped"].to_numpy(float))
+                if len(w_df) > 0:
+                    anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                    safe_to_csv(w_df, os.path.join(anadir, f"williams_{mode}.csv"), index=False)
+                    _save_williams_plot(w_df, h_star, os.path.join(figdir, f"williams_{mode}.{PLOTS_FMT}"),
+                                        f"{mode} | Williams")
+
+                _save_pi_calibration_curve_kfold(oof_df, os.path.join(figdir, f"pi_calibration_{mode}.{PLOTS_FMT}"))
+
+            # per-adduct calibration for the chosen single route
+            grp = (tr_m_k if (chosen == 'k' and tr_m_k is not None) else tr_m_rt).groupby("adduct")
+            for adg, tr_g in grp:
+                if len(tr_g) < min_group_n: continue
+                if chosen == "k" and (tr_m_k is not None):
+                    mask_g = (tr_m_k["adduct"] == adg).to_numpy()
+                    oof_g = oof_k[tr_k[tr_k["ion_mode"] == mode].index.values][mask_g]
+                    cal_oof_g, _ = isotonic_fit_apply(oof_g, tr_g["target"].to_numpy(float), oof_g)
+                    tr_local_g = tr_g[["compound_name", "rt"]].copy()
+                    tr_local_g["pred"] = cal_oof_g;
+                    tr_local_g["is_anchor"] = 0
+                    mask_te = (out_mode["adduct"] == adg)
+                    if mask_te.any():
+                        te_idx_adg = test[(test["ion_mode"] == mode) & (test["adduct"] == adg)].index.values
+                        p_base_adg = predict_ensemble(ens_k, Xte_k[te_idx_adg])
+                        _, pred_cal_adg = isotonic_fit_apply(oof_g, tr_g["target"].to_numpy(float), p_base_adg)
+                        rt_adg = map_pred_to_rt_safe(tr_local_g, pred_cal_adg, sp_cut)
+                        out_mode.loc[mask_te, "rt_pred"] = np.clip(rt_adg, 0.01, None)
+                else:
+                    mask_g = (tr_m_rt["adduct"] == adg).to_numpy()
+                    oof_g = oof_rt[tr_rt[tr_rt["ion_mode"] == mode].index.values][mask_g]
+                    cal_oof_g, _ = isotonic_fit_apply(oof_g, tr_g["rt"].to_numpy(float), oof_g)
+                    tr_local_g = tr_g[["compound_name", "rt"]].copy()
+                    tr_local_g["pred"] = cal_oof_g;
+                    tr_local_g["is_anchor"] = 0
+                    mask_te = (out_mode["adduct"] == adg)
+                    if mask_te.any():
+                        te_idx_adg = test[(test["ion_mode"] == mode) & (test["adduct"] == adg)].index.values
+                        p_base_adg = predict_ensemble(ens_rt, Xte_rt[te_idx_adg])
+                        _, pred_cal_adg = isotonic_fit_apply(oof_g, tr_g["rt"].to_numpy(float), p_base_adg)
+                        rt_adg = map_pred_to_rt_safe(tr_local_g, pred_cal_adg, sp_cut)
+                        out_mode.loc[mask_te, "rt_pred"] = np.clip(rt_adg, 0.01, None)
+
+            if PRINT_PER_MODE_METRICS:
+                print(f"\n=== [{mode}] (chosen={chosen}) Metrics (OOF, RT-space) ===")
+                for k, v in met.items():
+                    print(f"{k}: {v:.4f}" if isinstance(v, float) else f"{k}: {v}")
+                print(f"q80_abs_err: {q80:.3f} | q95_abs_err: {q95:.3f} | "
+                      f"cov80: {cov80:.3f} | cov95: {cov95:.3f} | anchors_used: {anchors_used}")
+
+            extras_mode = compute_extras_from_oof(oof_df)
+            safe_to_csv(
+                pd.DataFrame([{"mode": mode, **met, **extras_mode,
+                               "q80_abs_err": q80, "q95_abs_err": q95,
+                               "anchors_used": anchors_used,
+                               "n_train": int((len(tr_m_k) if chosen == 'k' and tr_m_k is not None else len(tr_m_rt))),
+                               "n_test": int(len(te_m)),
+                               "target_space": chosen}]),
+                os.path.join(outdir, f"metrics_{mode}.csv"),
+                index=False
+            )
+
+            if 'mode_decisions' not in locals(): mode_decisions = {}
+            mode_decisions[mode] = {
+                "strategy": chosen,
+                "q80": q80, "q95": q95,
+                "tr_local_rt": tr_local_rt,
+                "tr_local_k": tr_local_k
+            }
+
+            summary_rows.append({"mode": mode, **met, "q80_abs_err": q80, "q95_abs_err": q95,
+                                 "anchors_used": anchors_used,
+                                 "n_train": int(
+                                     (len(tr_m_k) if chosen == 'k' and tr_m_k is not None else len(tr_m_rt))),
+                                 "n_test": int(len(te_m)),
+                                 "target_space": chosen})
+            all_preds.append(out_mode)
+
+        pred_all = pd.concat(all_preds, axis=0, ignore_index=True)
+        pred_all.sort_values(["ion_mode", "rt_pred"], inplace=True)
+        safe_to_csv(pred_all, os.path.join(outdir, "predicted_rt_theory.csv"), index=False)
+
+        # —— 新增：保存 inhouse 总表 ——
+        if 'inhouse_rows' in locals() and len(inhouse_rows) > 0:
+            pred_inhouse = pd.concat(inhouse_rows, axis=0, ignore_index=True)
+            pred_inhouse.sort_values(["ion_mode", "rt_pred"], inplace=True)
+            safe_to_csv(pred_inhouse, os.path.join(outdir, "predicted_rt_inhouse.csv"), index=False)
+
+        summary_rows = add_pooled_macro_rows(outdir, summary_rows)
+        safe_to_csv(pd.DataFrame(summary_rows), os.path.join(outdir, "metrics_summary.csv"), index=False)
+
+        try:
+            save_pooled_and_macro_metrics(outdir)
+        except Exception:
+            pass
+
+        try:
+            df_pos = _load_oof_mode(outdir, "POS")
+            df_neg = _load_oof_mode(outdir, "NEG")
+            if (df_pos is not None) or (df_neg is not None):
+                figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                _save_box_err_by_mode(df_pos, df_neg, os.path.join(figdir, f"box_by_mode.{PLOTS_FMT}"))
+        except Exception:
+            pass
+
+        try:
+            pth_pool = os.path.join(outdir, "oof_POOLED.csv")
+            if os.path.exists(pth_pool):
+                dpool = pd.read_csv(pth_pool)
+                if len(dpool) > 0:
+                    figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                    _save_error_vs_tanimoto(dpool, os.path.join(figdir, f"error_vs_tanimoto_POOLED.{PLOTS_FMT}"), "POOLED")
+        except Exception:
+            pass
+
+        write_ad_reports(outdir)
+        make_ad_oof_summary(outdir)
+        make_ad_test_summary(outdir)
+
+
+        # --- POOLED Tanimoto
+        try:
+            pth_pool = os.path.join(outdir, "oof_POOLED.csv")
+            if os.path.exists(pth_pool):
+                dpool = pd.read_csv(pth_pool)
+                if len(dpool) > 0:
+                    figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                    _save_error_vs_tanimoto(dpool, os.path.join(figdir, f"error_vs_tanimoto_POOLED.{PLOTS_FMT}"),
+                                            "POOLED")
+        except Exception as _e:
+            pass
+
+        # build report
+        report = {"config": {
+            "CALIBRATION_SCOPE": CALIBRATION_SCOPE, "CHOSEN_SPACE_GLOBAL": CHOSEN_SPACE_GLOBAL,
+            "K_COVERAGE_THRESH": K_COVERAGE_THRESH, "CORR_FILTER_TOPN": CORR_FILTER_TOPN, "USE_KRR": USE_KRR,
+            "ROBUST_C": ROBUST_C,
+            "SPEARMAN_CUTOFF_POS": SPEARMAN_CUTOFF_POS, "SPEARMAN_CUTOFF_NEG": SPEARMAN_CUTOFF_NEG,
+            "ANCHORS_N_POS": ANCHORS_N_POS, "ANCHORS_N_NEG": ANCHORS_N_NEG,
+            "ANCHORS_MAX_FRAC": ANCHORS_MAX_FRAC, "ANCHORS_MIN_GAP": ANCHORS_MIN_GAP,
+            "MIN_GAP_POS": MIN_GAP_POS, "MIN_GAP_NEG": MIN_GAP_NEG,
+            "MIN_GROUP_N": MIN_GROUP_N, "USE_STACKING": USE_STACKING,
+            "USE_FP": USE_FP, "FP_BITS": FP_BITS, "FP_RADIUS": FP_RADIUS, "FP_SVD": FP_SVD,
+            "USE_RD_1D2D": USE_RD_1D2D, "USE_RD_3D": USE_RD_3D,
+            "USE_3D_MMFF_OPT": USE_3D_MMFF_OPT, "EMBED_MAXITERS": EMBED_MAXITERS,
+            "MAX_3D_FAIL_RATIO": MAX_3D_FAIL_RATIO,
+            "SPEED_PROFILE": SPEED_PROFILE, "N_JOBS": N_JOBS, "USE_3D_CACHE": USE_3D_CACHE
+        },
+            "global_metrics": {"RT": locals().get('mets_rt_global', None),
+                               "k": locals().get('mets_k_global', None)},
+            "summary": summary_rows}
+        with open(os.path.join(outdir, "report.json"), "w", encoding="utf-8") as f:
+            json.dump(report, f, ensure_ascii=False, indent=2)
+
+        # write anchors used
+        for m in ("POS", "NEG"):
+            with open(os.path.join(outdir, f"anchors_{m}.txt"), "w", encoding="utf-8") as f:
+                for nm in sorted(set(anchors_written.get(m, []))): f.write(str(nm) + "\n")
+
+        print("\n[OK] Predictions (theory) saved:", os.path.join(outdir, "predicted_rt_theory.csv"))
+        print("[OK] Predictions (inhouse) saved:", os.path.join(outdir, "predicted_rt_inhouse.csv"))
+        if CALIBRATION_SCOPE.lower() == "global":
+            print("[OK] Metrics saved: metrics_summary.csv & metrics_GLOBAL.csv")
+        else:
+            print("[OK] Metrics saved: metrics_summary.csv & metrics_<MODE>.csv")
+        print("[OK] Report saved:", os.path.join(outdir, "report.json"))
+        print("[OK] Anchors used (POS):", os.path.join(outdir, "anchors_POS.txt"))
+        print("[OK] Anchors used (NEG):", os.path.join(outdir, "anchors_NEG.txt"))
+
+        # ====================== Validation (post-hoc) ======================
+        def _validation_make_dir():
+            return makedirs(os.path.join(outdir, "validation"))
+
+        def _y_scramble_cv(X: np.ndarray, y: np.ndarray, runs: int, n_splits: int) -> Dict[str, Any]:
+            """Run y-scrambling using the same CV scaffold (disable KRR for speed)."""
+            P = _profile_params(SPEED_PROFILE)
+            runs = max(0, int(runs))
+            if runs == 0:
+                return {"runs": 0, "r2_list": [], "p_ge_obs": None}
+            r2s = []
+            rs = np.random.RandomState(SEED)
+            for i in range(runs):
+                y_perm = rs.permutation(y)
+                _, __, mets_perm, ___ = train_cv_ensemble_robust(
+                    X, y_perm, n_splits=n_splits, seed=SEED + 100 + i, use_krr=0
+                )
+                r2s.append(float(mets_perm.get("R2", np.nan)))
+            return {"runs": runs, "r2_list": r2s}
+
+        def _load_external_df(path_like: str) -> Optional[pd.DataFrame]:
+            if not path_like or not str(path_like).strip() or not os.path.exists(path_like):
+                return None
+            p = str(path_like)
+            if p.lower().endswith(".csv"):
+                ext = normalize_cols(read_csv_any(p))
+                # flexible column mapping
+                name = pick(ext, ["compound_name", "name", "compound", "analyte", "analyte_name",
+                                  "standard_name"]) or "compound_name"
+                smi = pick(ext, ["smiles"]) or "smiles"
+                rt_c = pick(ext, ["rt", "retention_time", "rt_min", "rt_minutes", "retention_time_min"])
+                mode = pick(ext, ["ion_mode", "polarity", "mode"]) or "ion_mode"
+                add = pick(ext, ["adduct", "precursor_ion", "precursor", "ion"]) or "adduct"
+                out = pd.DataFrame({
+                    "compound_name": ext[name],
+                    "smiles": ext[smi] if smi in ext.columns else np.nan,
+                    "rt": pd.to_numeric(ext[rt_c], errors="coerce") if rt_c in ext.columns else np.nan,
+                    "ion_mode": ext[mode].map(unify_mode) if mode in ext.columns else "POS",
+                    "adduct": ext[add].map(std_adduct) if add in ext.columns else "UNK",
+                })
+                # best-effort fill missing SMILES from training/theory tables
+                if out["smiles"].isna().any():
+                    all_lookup = pd.concat([
+                        train[["compound_name", "smiles"]],
+                        test[["compound_name", "smiles"]]
+                    ], axis=0).dropna().drop_duplicates("compound_name")
+                    out = out.merge(all_lookup, on="compound_name", how="left", suffixes=("", "_lut"))
+                    out["smiles"] = out["smiles"].fillna(out["smiles_lut"]);
+                    out.drop(columns=[c for c in out.columns if c.endswith("_lut")], inplace=True)
+                return out.dropna(subset=["compound_name", "smiles"]).reset_index(drop=True)
+
+            # txt list (names only) – return prediction-only dataframe without rt
+            names = [x.strip() for x in open(p, encoding="utf-8").read().splitlines() if x.strip()]
+            if not names: return None
+            all_lookup = pd.concat([
+                train[["compound_name", "smiles", "ion_mode", "adduct"]],
+                test[["compound_name", "smiles", "ion_mode", "adduct"]]
+            ], axis=0).dropna(subset=["compound_name", "smiles"])
+            ext = all_lookup[all_lookup["compound_name"].astype(str).isin(set(names))].drop_duplicates(
+                "compound_name").copy()
+            if len(ext) == 0: return None
+            ext["rt"] = np.nan
+            return ext.reset_index(drop=True)
+
+        def _predict_for_external(ext_df: pd.DataFrame) -> pd.DataFrame:
+            """Use the trained ensembles and the same mapping logic to predict RT for external df."""
+            if CALIBRATION_SCOPE.lower() == "global":
+                # rebuild global decision and apply to external
+                auto_global = auto_select_anchors(
+                    tr_rt, n_total=min(max(12, int(np.ceil(len(tr_rt) * ANCHORS_MAX_FRAC * 2))), 60),
+                    per_adduct_min=3, min_gap=ANCHORS_MIN_GAP
+                )
+                tr_rt_local, _, _, mets_rt = choose_space_and_build_mapper(
+                    tr_rt, oof_rt, tr_rt["rt"], anchors_df=auto_global, spearman_cutoff=0.78
+                )
+                use_k_global = False
+                tr_k_local = None;
+                mets_k = None
+                if (ens_k is not None) and (tr_k is not None) and (oof_k is not None):
+                    tr_k_local, _, _, mets_k = choose_space_and_build_mapper(
+                        tr_k, oof_k, tr_k["target"], anchors_df=auto_global, spearman_cutoff=0.78
+                    )
+                    if CHOSEN_SPACE_GLOBAL.lower() == "k":
+                        use_k_global = True
+                    elif CHOSEN_SPACE_GLOBAL.lower() == "auto":
+                        use_k_global = (mets_k["R2"] >= mets_rt["R2"] - 1e-3)
+                    else:
+                        use_k_global = False
+                chosen = "k" if use_k_global else "rt"
+
+                # feature build (validation toggles for speed)
+                schema_path = os.path.join(art_dir, "schema_k.pkl" if chosen == "k" else "schema_rt.pkl")
+                schema = load_schema(schema_path)
+                Xte_ext = features_from_schema(
+                    ext_df, schema,
+                    USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                    USE_RD_1D2D, USE_RD_3D, outdir=outdir
+                )
+
+                if chosen == "k":
+                    p_base = predict_ensemble(ens_k, Xte_ext)
+                    _, pred_cal = isotonic_fit_apply(oof_k, tr_k["target"].to_numpy(float), p_base)
+                    rt_ext = map_pred_to_rt_safe(tr_k_local, pred_cal, 0.78)
+                else:
+                    p_base = predict_ensemble(ens_rt, Xte_ext)
+                    _, pred_cal = isotonic_fit_apply(oof_rt, tr_rt["rt"].to_numpy(float), p_base)
+                    rt_ext = map_pred_to_rt_safe(tr_rt_local, pred_cal, 0.78)
+
+                out = ext_df[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+                out["rt_pred"] = np.clip(rt_ext, 0.01, None)
+
+                # --- FP/Tanimoto
+                sims_fp, nearest_fp, flags_fp = ood_nearest_fp(
+                    train["smiles"].astype(str).tolist(),
+                    test["smiles"].astype(str).tolist(),
+                    train["compound_name"].astype(str).tolist(),
+                    radius=FP_RADIUS, n_bits=FP_BITS, thresh=0.2
+                )
+                out_all["nearest_sim_fp"] = sims_fp
+                out_all["nearest_train_fp"] = nearest_fp
+                out_all["OOD_flag_FP"] = flags_fp
+
+                return out
+
+            # per-mode path
+            outs = []
+            for mode in ("POS", "NEG"):
+                ext_m = ext_df[ext_df["ion_mode"].map(unify_mode) == mode].copy()
+                if len(ext_m) == 0:
+                    continue
+                sp_cut = SPEARMAN_CUTOFF_POS if mode == "POS" else SPEARMAN_CUTOFF_NEG
+
+                # rebuild per-mode mapping on train
+                tr_m_rt = tr_rt[tr_rt["ion_mode"] == mode].reset_index(drop=True)
+                tr_m_k = tr_k[tr_k["ion_mode"] == mode].reset_index(drop=True) if (tr_k is not None) else None
+
+                # calibrate rt branch
+                tr_local_rt = None;
+                cal_oof_rt_m = None;
+                mets_rt_mode = {"R2": -1e9}
+                if len(tr_m_rt) >= 8:
+                    idx_m_rt = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                    oof_rt_m = oof_rt[idx_m_rt]
+                    cal_oof_rt_m, _ = isotonic_fit_apply(oof_rt_m, tr_m_rt["rt"].to_numpy(float), oof_rt_m)
+                    anc_rt = auto_select_anchors(tr_m_rt, n_total=(ANCHORS_N_POS if mode == "POS" else ANCHORS_N_NEG),
+                                                 per_adduct_min=(5 if mode == "POS" else 3),
+                                                 min_gap=(MIN_GAP_POS if mode == "POS" else MIN_GAP_NEG))
+                    tr_local_rt = tr_m_rt[["compound_name", "rt"]].copy()
+                    tr_local_rt["pred"] = cal_oof_rt_m
+                    tr_local_rt["is_anchor"] = tr_local_rt["compound_name"].isin(anc_rt["compound_name"]).astype(int)
+                    mapped = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                    mets_rt_mode = metrics(tr_m_rt["rt"].to_numpy(float), mapped)
+
+                # calibrate k branch
+                have_k = (ens_k is not None) and (tr_k is not None) and (oof_k is not None) and (
+                            tr_m_k is not None) and (len(tr_m_k) >= 8)
+                tr_local_k = None;
+                cal_oof_k_m = None;
+                mets_k_mode = {"R2": -1e9}
+                if have_k:
+                    idx_m_k = tr_k[tr_k["ion_mode"] == mode].index.values
+                    oof_k_m = oof_k[idx_m_k]
+                    cal_oof_k_m, _ = isotonic_fit_apply(oof_k_m, tr_m_k["target"].to_numpy(float), oof_k_m)
+                    anc_k = auto_select_anchors(tr_m_k, n_total=(ANCHORS_N_POS if mode == "POS" else ANCHORS_N_NEG),
+                                                per_adduct_min=(5 if mode == "POS" else 3),
+                                                min_gap=(MIN_GAP_POS if mode == "POS" else MIN_GAP_NEG))
+                    tr_local_k = tr_m_k[["compound_name", "rt"]].copy()
+                    tr_local_k["pred"] = cal_oof_k_m
+                    tr_local_k["is_anchor"] = tr_local_k["compound_name"].isin(anc_k["compound_name"]).astype(int)
+                    mapped = map_pred_to_rt_safe(tr_local_k, cal_oof_k_m, sp_cut)
+                    mets_k_mode = metrics(tr_m_k["rt"].to_numpy(float), mapped)
+
+                # choose
+                if have_k:
+                    if mode == "NEG":
+                        chosen = "k" if (mets_k_mode["R2"] - mets_rt_mode["R2"]) >= 0.05 else "rt"
+                    else:
+                        chosen = "k" if (mets_k_mode["R2"] >= max(0.40, mets_rt_mode["R2"] - 0.10)) else "rt"
+                else:
+                    chosen = "rt"
+
+                # build features for external
+                dummy_tr = tr_k if chosen == "k" else tr_rt
+                schema = load_schema(os.path.join(art_dir, "schema_k.pkl" if chosen == "k" else "schema_rt.pkl"))
+                Xte_ext = features_from_schema(
+                    ext_m, schema,
+                    USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                    USE_RD_1D2D, USE_RD_3D, outdir=outdir
+                )
+
+                if chosen == "k":
+                    p_base = predict_ensemble(ens_k, Xte_ext)
+                    idx_fit = tr_k[tr_k["ion_mode"] == mode].index.values
+                    oof_fit = oof_k[idx_fit];
+                    y_fit = tr_m_k["target"].to_numpy(float)
+                    _, pred_cal = isotonic_fit_apply(oof_fit, y_fit, p_base)
+                    rt_ext = map_pred_to_rt_safe(tr_local_k, pred_cal, sp_cut)
+                else:
+                    p_base = predict_ensemble(ens_rt, Xte_ext)
+                    idx_fit = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                    oof_fit = oof_rt[idx_fit];
+                    y_fit = tr_m_rt["rt"].to_numpy(float)
+                    _, pred_cal = isotonic_fit_apply(oof_fit, y_fit, p_base)
+                    rt_ext = map_pred_to_rt_safe(tr_local_rt, pred_cal, sp_cut)
+
+                out_m = ext_m[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+                out_m["rt_pred"] = np.clip(rt_ext, 0.01, None)
+                outs.append(out_m)
+
+            if len(outs) == 0:
+                return pd.DataFrame(columns=["compound_name", "smiles", "ion_mode", "adduct", "rt_pred"])
+            return pd.concat(outs, axis=0, ignore_index=True)
+
+        # ---- run validation
+        if RUN_VALIDATION:
+            vdir = _validation_make_dir()
+
+            # 1) y-scrambling on RT branch
+            try:
+                ns = 5 if len(tr_rt) >= 25 else 4
+                ys = _y_scramble_cv(Xtr_rt, tr_rt["target"].to_numpy(float),
+                                    _profile_params(SPEED_PROFILE)["scramble_runs"], ns)
+                obs_r2 = float(locals().get('mets_rt_global', {}).get("R2", np.nan))
+                r2_list = ys["r2_list"]
+                p_ge_obs = None
+                if len(r2_list) > 0 and np.isfinite(obs_r2):
+                    p_ge_obs = (np.sum(np.array(r2_list) >= obs_r2) + 1.0) / (len(r2_list) + 1.0)
+                val_json = {"observed_R2": obs_r2, "scramble_runs": ys["runs"], "scramble_R2": r2_list,
+                            "p_ge_obs": p_ge_obs}
+                with open(os.path.join(vdir, "y_scrambling.json"), "w", encoding="utf-8") as f:
+                    json.dump(val_json, f, ensure_ascii=False, indent=2)
+                safe_to_csv(pd.DataFrame({"R2_perm": r2_list}), os.path.join(vdir, "y_scrambling_r2.csv"), index=False)
+                print(f"[VALID] y-scrambling done. Estimated p(R2_perm >= observed) = {p_ge_obs}")
+            except Exception as e:
+                print("[VALID][WARN] y-scrambling failed:", e)
+
+        # 2) external set evaluation (if provided)
+        try:
+            valdir = _ensure_dir(os.path.join(outdir, "validation"))
+
+            # --- helper: load external set (CSV/TXT) ---
+            def _load_external_df_any(ext_path: str) -> pd.DataFrame:
+                if (ext_path is None) or (str(ext_path).strip() == "") or (not os.path.exists(ext_path)):
+                    raise FileNotFoundError("EXTERNAL_LIST not found")
+                # TXT: 每行一个 compound_name -> 从 test 里挑；若没有标签，则只能保存预测
+                if ext_path.lower().endswith(".txt"):
+                    names = [x.strip() for x in open(ext_path, encoding="utf-8").read().splitlines() if x.strip()]
+                    df = test[test["compound_name"].astype(str).isin(names)].copy()
+                    df["rt_true"] = np.nan
+                    df["t0"] = np.nan
+                    return df.reset_index(drop=True)
+
+                # CSV
+                raw = normalize_cols(read_csv_any(ext_path))
+                name = pick(raw, ["compound_name", "name", "compound", "analyte", "analyte_name",
+                                  "standard_name"]) or "compound_name"
+                smi = pick(raw, ["smiles"]) or "smiles"
+                mode = pick(raw, ["ion_mode", "polarity", "mode"]) or "ion_mode"
+                add = pick(raw, ["adduct", "precursor_ion", "precursor", "ion"]) or "adduct"
+                rt_c = pick(raw, ["rt", "retention_time", "rt_min", "rt_minutes", "retention_time_min"])
+                t0_c = pick(raw, ["t0", "t_zero", "void_time", "dead_time", "t0_min"])
+                df = pd.DataFrame({
+                    "compound_name": raw[name],
+                    "smiles": raw[smi],
+                    "ion_mode": raw[mode].map(unify_mode) if mode in raw.columns else "POS",
+                    "adduct": raw[add].map(std_adduct) if add in raw.columns else "UNK",
+                }).dropna(subset=["compound_name", "smiles"]).reset_index(drop=True)
+                if rt_c is not None and rt_c in raw.columns:
+                    df["rt_true"] = pd.to_numeric(raw[rt_c], errors="coerce")
+                else:
+                    df["rt_true"] = np.nan
+                if t0_c is not None and t0_c in raw.columns:
+                    df["t0"] = pd.to_numeric(raw[t0_c], errors="coerce")
+                else:
+                    df["t0"] = np.nan
+                return df
+
+            ext_df = _load_external_df_any(EXTERNAL_LIST)
+            if len(ext_df) == 0:
+                raise RuntimeError("external set empty")
+
+            # schema
+            schema_rt_path = os.path.join(art_dir, "schema_rt.pkl")
+            schema_k_path = os.path.join(art_dir, "schema_k.pkl")
+            schema_rt = load_schema(schema_rt_path) if os.path.exists(schema_rt_path) else None
+            schema_k = load_schema(schema_k_path) if os.path.exists(schema_k_path) else None
+
+            # Q²(F1/F2/F3)
+            def _q2_external(y_true: np.ndarray, y_pred: np.ndarray, y_train_for_den: np.ndarray) -> dict:
+                y_true = np.asarray(y_true, float);
+                y_pred = np.asarray(y_pred, float)
+                m = np.isfinite(y_true) & np.isfinite(y_pred)
+                if m.sum() < 3 or y_train_for_den.size < 3:
+                    return {"Q2_F1": np.nan, "Q2_F2": np.nan, "Q2_F3": np.nan}
+                yt, yp = y_true[m], y_pred[m]
+                sse = float(np.sum((yp - yt) ** 2))
+                mu_tr = float(np.mean(y_train_for_den))
+                mu_ex = float(np.mean(yt))
+                sst_f1 = float(np.sum((yt - mu_tr) ** 2))
+                sst_f2 = float(np.sum((yt - mu_ex) ** 2))
+                var_tr = float(np.sum((y_train_for_den - mu_tr) ** 2) / max(1, len(y_train_for_den)))
+                q1 = float(1.0 - sse / (sst_f1 + 1e-12)) if sst_f1 > 0 else np.nan
+                q2 = float(1.0 - sse / (sst_f2 + 1e-12)) if sst_f2 > 0 else np.nan
+                q3 = float(1.0 - (sse / max(1, m.sum())) / (var_tr + 1e-12)) if var_tr > 0 else np.nan
+                return {"Q2_F1": q1, "Q2_F2": q2, "Q2_F3": q3}
+
+            def _ext_pi_calibration(err_train_abs: np.ndarray, err_ext_abs: np.ndarray,
+                                    alphas=np.linspace(0.5, 0.99, 11)) -> pd.DataFrame:
+                rows = []
+                if (err_train_abs is None) or (err_ext_abs is None):
+                    return pd.DataFrame(columns=["nominal", "actual"])
+                err_train_abs = np.asarray(err_train_abs, float)
+                err_ext_abs = np.asarray(err_ext_abs, float)
+                if np.sum(np.isfinite(err_ext_abs)) < 3 or np.sum(np.isfinite(err_train_abs)) < 3:
+                    return pd.DataFrame(columns=["nominal", "actual"])
+                for a in alphas:
+                    t = float(np.nanquantile(err_train_abs, a))
+                    cov = float(np.nanmean(err_ext_abs <= t))
+                    rows.append({"nominal": float(a), "actual": cov})
+                return pd.DataFrame(rows)
+
+            ext_preds_all = []
+            metrics_rows = []
+            pi_rows = []
+
+            for mode in ("POS", "NEG"):
+                ext_m = ext_df[ext_df["ion_mode"].map(unify_mode) == mode].reset_index(drop=True)
+                if len(ext_m) == 0:
+                    continue
+
+                sp_cut = SPEARMAN_CUTOFF_POS if mode == "POS" else SPEARMAN_CUTOFF_NEG
+
+                tr_m_rt = tr_rt[tr_rt["ion_mode"] == mode].reset_index(drop=True)
+                mapped_rt_ok = False
+                if len(tr_m_rt) >= 8:
+                    idx_m_rt = tr_rt[tr_rt["ion_mode"] == mode].index.values
+                    oof_rt_m = oof_rt[idx_m_rt]
+                    cal_oof_rt_m, _ = isotonic_fit_apply(oof_rt_m, tr_m_rt["rt"].to_numpy(float), oof_rt_m)
+                    tr_local_rt = tr_m_rt[["compound_name", "rt"]].copy()
+                    tr_local_rt["pred"] = cal_oof_rt_m
+                    tr_local_rt["is_anchor"] = 0
+                    mapped_rt_oof_rt = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                    mets_rt_mode = metrics(tr_m_rt["rt"].to_numpy(float), mapped_rt_oof_rt)
+                    mapped_rt_ok = True
+                else:
+                    mets_rt_mode = {"R2": -1e9}
+
+                have_k = (ens_k is not None) and (tr_k is not None) and (oof_k is not None) and (schema_k is not None)
+                mapped_k_ok = False
+                if have_k:
+                    tr_m_k = tr_k[tr_k["ion_mode"] == mode].reset_index(drop=True)
+                    if len(tr_m_k) >= 8:
+                        idx_m_k = tr_k[tr_k["ion_mode"] == mode].index.values
+                        oof_k_m = oof_k[idx_m_k]
+                        cal_oof_k_m, _ = isotonic_fit_apply(oof_k_m, tr_m_k["target"].to_numpy(float), oof_k_m)
+                        tr_local_k = tr_m_k[["compound_name", "rt"]].copy()
+                        tr_local_k["pred"] = cal_oof_k_m
+                        tr_local_k["is_anchor"] = 0
+                        mapped_rt_oof_k = map_pred_to_rt_safe(tr_local_k, cal_oof_k_m, sp_cut)
+                        mets_k_mode = metrics(tr_m_k["rt"].to_numpy(float), mapped_rt_oof_k)
+                        mapped_k_ok = True
+                    else:
+                        mets_k_mode = {"R2": -1e9}
+                else:
+                    mets_k_mode = {"R2": -1e9}
+
+                use_stack = False
+                if mapped_rt_ok and mapped_k_ok:
+                    mapped_rt_oof_rt_safe = map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m, sp_cut)
+                    mapped_rt_oof_k_safe = map_pred_to_rt_safe(tr_local_k, cal_oof_k_m, sp_cut)
+                    y_train_rt = tr_m_rt["rt"].to_numpy(float)
+                    oof_stack, stacker = fit_stacker_oof(y_train_rt, mapped_rt_oof_rt_safe, mapped_rt_oof_k_safe)
+                    tr_local_stack = tr_m_rt[["compound_name", "rt"]].copy()
+                    tr_local_stack["pred"] = oof_stack
+                    tr_local_stack["is_anchor"] = 0
+                    mapped_oof_stack = map_pred_to_rt_safe(tr_local_stack, oof_stack, sp_cut)
+                    mets_stack = metrics(y_train_rt, mapped_oof_stack)
+                    best_single = max(mets_rt_mode.get("R2", -1e9), mets_k_mode.get("R2", -1e9))
+                    if mode == "NEG":
+                        if (mets_k_mode.get("R2", -1e9) - mets_rt_mode.get("R2", -1e9)) >= 0.05:
+                            use_stack = False
+                        else:
+                            use_stack = (mets_stack["R2"] >= best_single - 1e-4)
+                    else:
+                        use_stack = (mets_stack["R2"] >= best_single - 5e-3)
+
+                Xext_rt = features_from_schema(ext_m, schema_rt, USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                                               USE_RD_1D2D, USE_RD_3D, outdir=outdir) if schema_rt is not None else None
+                p_base_rt = predict_ensemble(ens_rt, Xext_rt) if Xext_rt is not None else None
+
+                rt_ext_from_k = None
+                if mapped_k_ok:
+                    Xext_k = features_from_schema(ext_m, schema_k, USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                                                  USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+                    p_base_k = predict_ensemble(ens_k, Xext_k)
+                else:
+                    Xext_k, p_base_k = None, None
+
+                rt_ext_from_rt = None
+                if mapped_rt_ok and (p_base_rt is not None):
+                    _, pred_cal_rt = isotonic_fit_apply(
+                        oof_rt[tr_rt[tr_rt["ion_mode"] == mode].index.values],
+                        tr_m_rt["rt"].to_numpy(float),
+                        p_base_rt
+                    )
+                    rt_ext_from_rt = map_pred_to_rt_safe(tr_local_rt, pred_cal_rt, sp_cut)
+
+                if mapped_k_ok and (p_base_k is not None):
+                    _, pred_cal_k = isotonic_fit_apply(
+                        oof_k[tr_k[tr_k["ion_mode"] == mode].index.values],
+                        tr_m_k["target"].to_numpy(float),
+                        p_base_k
+                    )
+                    rt_ext_from_k = map_pred_to_rt_safe(tr_local_k, pred_cal_k, sp_cut)
+
+                if use_stack and (rt_ext_from_rt is not None) and (rt_ext_from_k is not None):
+                    pred_stack_ext = apply_stacker(stacker, rt_ext_from_rt, rt_ext_from_k)
+                    rt_ext_final = map_pred_to_rt_safe(tr_local_stack, pred_stack_ext, sp_cut)
+                    resid_train = tr_m_rt["rt"].to_numpy(float) - mapped_oof_stack
+                    chosen_label = "stack"
+                else:
+                    use_k_for_mode = False
+                    if mapped_k_ok:
+                        if mode == "NEG":
+                            use_k_for_mode = (mets_k_mode["R2"] - mets_rt_mode["R2"]) >= 0.05
+                        else:
+                            use_k_for_mode = (mets_k_mode["R2"] >= max(0.40, mets_rt_mode["R2"] - 0.10))
+                    if use_k_for_mode and (rt_ext_from_k is not None):
+                        rt_ext_final = rt_ext_from_k
+                        resid_train = tr_m_k["rt"].to_numpy(float) - map_pred_to_rt_safe(tr_local_k, cal_oof_k_m,
+                                                                                         sp_cut)
+                        chosen_label = "k"
+                    else:
+                        rt_ext_final = rt_ext_from_rt
+                        resid_train = tr_m_rt["rt"].to_numpy(float) - map_pred_to_rt_safe(tr_local_rt, cal_oof_rt_m,
+                                                                                          sp_cut)
+                        chosen_label = "rt"
+
+                if rt_ext_final is None:
+                    continue
+
+                q80 = float(np.nanquantile(np.abs(resid_train), 0.80)) if np.isfinite(resid_train).any() else np.nan
+                q95 = float(np.nanquantile(np.abs(resid_train), 0.95)) if np.isfinite(resid_train).any() else np.nan
+
+                out_m = ext_m[["compound_name", "smiles", "ion_mode", "adduct"]].copy()
+                out_m["rt_true"] = pd.to_numeric(ext_m.get("rt_true", np.nan), errors="coerce")
+                out_m["rt_pred"] = np.clip(rt_ext_final, 0.01, None)
+                out_m["rt_lo80"] = np.clip(out_m["rt_pred"] - q80, 0.01, None) if np.isfinite(q80) else np.nan
+                out_m["rt_hi80"] = out_m["rt_pred"] + q80 if np.isfinite(q80) else np.nan
+                out_m["rt_lo95"] = np.clip(out_m["rt_pred"] - q95, 0.01, None) if np.isfinite(q95) else np.nan
+                out_m["rt_hi95"] = out_m["rt_pred"] + q95 if np.isfinite(q95) else np.nan
+
+                sims, nearest, flags = ood_nearest(
+                    train["smiles"].astype(str).tolist(),
+                    ext_m["smiles"].astype(str).tolist(),
+                    train["compound_name"].astype(str).tolist(), thresh=0.2
+                )
+                out_m["OOD_flag"] = flags;
+                out_m["nearest_sim"] = sims;
+                out_m["nearest_train"] = nearest
+                sims_fp, nearest_fp, flags_fp = ood_nearest_fp(
+                    train["smiles"].astype(str).tolist(),
+                    ext_m["smiles"].astype(str).tolist(),
+                    train["compound_name"].astype(str).tolist(),
+                    radius=FP_RADIUS, n_bits=FP_BITS, thresh=0.2
+                )
+                out_m["nearest_sim_fp"] = sims_fp
+                out_m["nearest_train_fp"] = nearest_fp
+                out_m["OOD_flag_FP"] = flags_fp
+
+                y_true = pd.to_numeric(out_m["rt_true"], errors="coerce").to_numpy(float)
+                y_pred = pd.to_numeric(out_m["rt_pred"], errors="coerce").to_numpy(float)
+                mvals = np.isfinite(y_true) & np.isfinite(y_pred) & (~np.isnan(y_true))
+                if np.sum(mvals) >= 3:
+                    yt = y_true[mvals];
+                    yp = y_pred[mvals]
+                    mae = float(np.mean(np.abs(yt - yp)))
+                    rmse = float(np.sqrt(np.mean((yt - yp) ** 2)))
+                    r2e = float(r2_score(yt, yp))
+                    spe = float(spearman_rho(yt, yp))
+                    extras = _extra_regression_stats(yt, yp)  # MedAE / CCC / r_m² / k / k'
+                    qdict = _q2_external(yt, yp, tr_m_rt["rt"].to_numpy(float))
+
+                    err_train_abs = np.abs(resid_train)
+                    err_ext_abs = np.abs(yt - yp)
+                    pi_df = _ext_pi_calibration(err_train_abs, err_ext_abs)
+                    if len(pi_df) > 0:
+                        pi_df.insert(0, "mode", mode)
+                        safe_to_csv(pi_df, os.path.join(valdir, f"external_pi_calibration_{mode}.csv"), index=False)
+                        pi_rows.append(pi_df)
+
+                    metrics_rows.append({
+                        "mode": mode, "chosen": chosen_label,
+                        "MAE": mae, "RMSE": rmse, "R2": r2e, "Spearman": spe,
+                        **extras, **qdict,
+                        "N_ext": int(np.sum(mvals)),
+                        "q80_train": q80, "q95_train": q95
+                    })
+
+                out_m["chosen_strategy"] = chosen_label
+                ext_preds_all.append(out_m)
+
+            if len(ext_preds_all) > 0:
+                ext_all = pd.concat(ext_preds_all, axis=0, ignore_index=True)
+                safe_to_csv(ext_all, os.path.join(valdir, "external_predictions.csv"), index=False)
+
+                if "rt_true" in ext_all.columns and ext_all["rt_true"].notna().sum() >= 3:
+                    yy = pd.to_numeric(ext_all["rt_true"], errors="coerce").to_numpy(float)
+                    pp = pd.to_numeric(ext_all["rt_pred"], errors="coerce").to_numpy(float)
+                    m = np.isfinite(yy) & np.isfinite(pp)
+                    yy, pp = yy[m], pp[m]
+                    mae = float(np.mean(np.abs(yy - pp)))
+                    rmse = float(np.sqrt(np.mean((yy - pp) ** 2)))
+                    r2e = float(r2_score(yy, pp))
+                    spe = float(spearman_rho(yy, pp))
+                    extras = _extra_regression_stats(yy, pp)
+                    qdict = _q2_external(yy, pp, tr_rt["rt"].to_numpy(float))
+                    metrics_rows.append({
+                        "mode": "POOLED", "chosen": "mixed",
+                        "MAE": mae, "RMSE": rmse, "R2": r2e, "Spearman": spe,
+                        **extras, **qdict, "N_ext": int(len(yy))
+                    })
+
+                    try:
+                        idx_all = np.arange(len(tr_rt))
+                        cal_all, _ = isotonic_fit_apply(oof_rt[idx_all], tr_rt["rt"].to_numpy(float), oof_rt[idx_all])
+                        tr_local_all = tr_rt[["compound_name", "rt"]].copy()
+                        tr_local_all["pred"] = cal_all;
+                        tr_local_all["is_anchor"] = 0
+                        mapped_all = map_pred_to_rt_safe(tr_local_all, cal_all, SPEARMAN_CUTOFF_POS)
+                        resid_train_all = tr_rt["rt"].to_numpy(float) - mapped_all
+                        pi_df_pool = _ext_pi_calibration(np.abs(resid_train_all), np.abs(yy - pp))
+                        if len(pi_df_pool) > 0:
+                            pi_df_pool.insert(0, "mode", "POOLED")
+                            safe_to_csv(pi_df_pool, os.path.join(valdir, f"external_pi_calibration_POOLED.csv"),
+                                        index=False)
+                            pi_rows.append(pi_df_pool)
+                    except Exception:
+                        pass
+
+                if len(metrics_rows) > 0:
+                    safe_to_csv(pd.DataFrame(metrics_rows), os.path.join(valdir, "external_metrics.csv"), index=False)
+                if len(pi_rows) > 0:
+                    all_pi = pd.concat(pi_rows, axis=0, ignore_index=True)
+                    safe_to_csv(all_pi, os.path.join(valdir, "external_pi_calibration.csv"), index=False)
+
+                print("[VALID] External predictions saved:",
+                      os.path.join(valdir, "external_predictions.csv"))
+            else:
+                print("[VALID] External list has no compounds in POS/NEG; skipped.")
+
+        except Exception as e:
+            print("[WARN] External evaluation skipped:", e)
+
+
+        # ====================== (Optional) Learning Curve & Ablation ======================
+        try:
+            if MAKE_LEARNING_CURVE:
+                anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                figdir = _ensure_dir(os.path.join(outdir, "figures"))
+                rows = []
+                rs = np.random.RandomState(LC_SEED)
+
+                for mode in ("POS","NEG"):
+
+                    tr_m = tr_rt[tr_rt["ion_mode"]==mode].reset_index(drop=True)
+                    if len(tr_m) < 15:
+                        continue
+                    n_total = len(tr_m)
+                    for frac in LC_POINTS:
+                        k = max(8, int(round(n_total * float(frac))))
+                        idx = np.sort(rs.choice(n_total, size=k, replace=False))
+                        sub = tr_m.iloc[idx].reset_index(drop=True)
+
+                        _, Xtr_sub, _ = build_feature_matrices(sub, sub,
+                                                               USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                                                               USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+                        n_splits = 5 if len(sub) >= 25 else 4
+                        ens_tmp, oof_tmp, mets_tmp, _ = train_cv_ensemble_robust(
+                            Xtr_sub, sub["rt"].to_numpy(float), n_splits=n_splits, seed=SEED, use_krr=bool(USE_KRR)
+                        )
+
+                        sub_local = sub[["compound_name","rt"]].copy()
+                        cal_oof_sub, _ = isotonic_fit_apply(oof_tmp, sub["rt"].to_numpy(float), oof_tmp)
+                        sub_local["pred"] = cal_oof_sub
+                        sub_local["is_anchor"] = 0
+                        mapped = map_pred_to_rt_safe(sub_local, cal_oof_sub, 0.78 if mode=="POS" else 0.70)
+                        mets_mapped = metrics(sub["rt"].to_numpy(float), mapped)
+                        rows.append({"mode":mode, "frac":float(frac), "N":int(k),
+                                     "R2":mets_mapped["R2"], "MAE":mets_mapped["MAE"], "RMSE":mets_mapped["RMSE"]})
+
+                if rows:
+                    df_lc = pd.DataFrame(rows)
+                    safe_to_csv(df_lc, os.path.join(anadir, "learning_curve.csv"), index=False)
+
+                    plt.figure(figsize=(5.2,3.6), dpi=PLOTS_DPI)
+                    for mode in sorted(df_lc["mode"].unique()):
+                        d= df_lc[df_lc["mode"]==mode].sort_values("frac")
+                        plt.plot(d["frac"], d["R2"], marker="o", label=mode)
+                    plt.xlabel("Train fraction"); plt.ylabel("R2 (OOF mapped)")
+                    plt.ylim(0, 1.02); plt.legend()
+                    plt.title("Learning Curve (RT branch, OOF mapped)")
+                    plt.tight_layout(); plt.savefig(os.path.join(figdir, f"learning_curve.{PLOTS_FMT}"), format=PLOTS_FMT); plt.close()
+
+            if MAKE_ABLATION:
+                anadir = _ensure_dir(os.path.join(outdir, "analysis"))
+                ab_rows = []
+                for mode in ("POS","NEG"):
+                    tr_m = tr_rt[tr_rt["ion_mode"]==mode].reset_index(drop=True)
+                    if len(tr_m) < 15: continue
+                    _, Xtr_b, _ = build_feature_matrices(tr_m, tr_m, USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                                                         USE_RD_1D2D, USE_RD_3D, outdir=outdir)
+                    ns = 5 if len(tr_m) >= 25 else 4
+                    _, oof_b, met_b, _ = train_cv_ensemble_robust(Xtr_b, tr_m["rt"].to_numpy(float),
+                                                                  n_splits=ns, seed=SEED, use_krr=bool(USE_KRR))
+                    sub_local = tr_m[["compound_name","rt"]].copy()
+                    cal_b, _ = isotonic_fit_apply(oof_b, tr_m["rt"].to_numpy(float), oof_b)
+                    sub_local["pred"] = cal_b; sub_local["is_anchor"] = 0
+                    map_b = map_pred_to_rt_safe(sub_local, cal_b, 0.78 if mode=="POS" else 0.70)
+                    met_bm = metrics(tr_m["rt"].to_numpy(float), map_b)
+                    ab_rows.append({"mode":mode, "setting":"baseline", "R2":met_bm["R2"], "MAE":met_bm["MAE"], "RMSE":met_bm["RMSE"]})
+
+                    # no-3D
+                    _, Xtr_n3d, _ = build_feature_matrices(tr_m, tr_m, USE_FP, FP_BITS, FP_RADIUS, FP_SVD,
+                                                           USE_RD_1D2D, 0, outdir=outdir)
+                    _, oof_n3d, met_n3d, _ = train_cv_ensemble_robust(Xtr_n3d, tr_m["rt"].to_numpy(float),
+                                                                      n_splits=ns, seed=SEED, use_krr=bool(USE_KRR))
+                    sub_local = tr_m[["compound_name","rt"]].copy()
+                    cal_n3d, _ = isotonic_fit_apply(oof_n3d, tr_m["rt"].to_numpy(float), oof_n3d)
+                    sub_local["pred"] = cal_n3d; sub_local["is_anchor"] = 0
+                    map_n3d = map_pred_to_rt_safe(sub_local, cal_n3d, 0.78 if mode=="POS" else 0.70)
+                    met_n3dm = metrics(tr_m["rt"].to_numpy(float), map_n3d)
+                    ab_rows.append({"mode":mode, "setting":"no_3D", "R2":met_n3dm["R2"], "MAE":met_n3dm["MAE"], "RMSE":met_n3dm["RMSE"]})
+
+                if len(ab_rows)>0:
+                    df_ab = pd.DataFrame(ab_rows)
+                    safe_to_csv(df_ab, os.path.join(anadir, "ablation.csv"), index=False)
+
+        except Exception as e:
+            print("[ANALYSIS][WARN]", e)
+
+        toc(T0, "TOTAL")
+
+# ---------- CLI ----------
+def main():
+    cfg_ready = all([str(INHOUSE_PATH).strip(), str(THEORY_PATH).strip(), str(OUTDIR).strip()])
+    if cfg_ready:
+        os.makedirs(OUTDIR, exist_ok=True)
+        run(INHOUSE_PATH, THEORY_PATH, OUTDIR,
+            anchors_user=ANCHORS_USER if str(ANCHORS_USER).strip() else None,
+            min_group_n=MIN_GROUP_N,
+            use_fp=USE_FP, fp_bits=FP_BITS, fp_radius=FP_RADIUS, fp_svd=FP_SVD,
+            use_rd_1d2d=USE_RD_1D2D, use_rd_3d=USE_RD_3D)
+        return
+
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="QSRR — MERGED TRAINING v2.2 (robust NEG + boosted POS) + Validation + Runtime Boosts")
+    ap.add_argument("--inhouse", required=True)
+    ap.add_argument("--theoretical", required=True)
+    ap.add_argument("--outdir", required=True)
+    ap.add_argument("--anchors_user", default=None)
+    ap.add_argument("--min_group_n", type=int, default=MIN_GROUP_N)
+    ap.add_argument("--use_fp", type=int, default=USE_FP)
+    ap.add_argument("--fp_bits", type=int, default=FP_BITS)
+    ap.add_argument("--fp_radius", type=int, default=FP_RADIUS)
+    ap.add_argument("--fp_svd", type=int, default=FP_SVD)
+    ap.add_argument("--use_rd_1d2d", type=int, default=USE_RD_1D2D)
+    ap.add_argument("--use_rd_3d", type=int, default=USE_RD_3D)
+    ap.add_argument("--speed_profile", type=str, default=SPEED_PROFILE, choices=["fast", "balanced", "exact"])
+    ap.add_argument("--n_jobs", type=int, default=N_JOBS)
+    ap.add_argument("--use_3d_cache", type=int, default=USE_3D_CACHE)
+    ap.add_argument("--run_validation", type=int, default=RUN_VALIDATION)
+    ap.add_argument("--run_scramble", type=int, default=RUN_SCRAMBLE)
+    ap.add_argument("--external_list", type=str, default=EXTERNAL_LIST)
+
+    args = ap.parse_args()
+
+    # override globals for this session (simple way)
+    globals()["SPEED_PROFILE"] = args.speed_profile
+    globals()["N_JOBS"] = args.n_jobs
+    globals()["USE_3D_CACHE"] = int(args.use_3d_cache)
+    globals()["RUN_VALIDATION"] = int(args.run_validation)
+    globals()["RUN_SCRAMBLE"] = int(args.run_scramble)
+    globals()["EXTERNAL_LIST"] = args.external_list or ""
+
+
+    os.makedirs(args.outdir, exist_ok=True)
+    run(args.inhouse, args.theoretical, args.outdir,
+        anchors_user=args.anchors_user,
+        min_group_n=int(args.min_group_n),
+        use_fp=int(args.use_fp), fp_bits=int(args.fp_bits),
+        fp_radius=int(args.fp_radius), fp_svd=int(args.fp_svd),
+        use_rd_1d2d=int(args.use_rd_1d2d), use_rd_3d=int(args.use_rd_3d))
+
+if __name__ == "__main__":
+        main()
