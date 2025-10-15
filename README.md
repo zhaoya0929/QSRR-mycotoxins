@@ -42,7 +42,7 @@ python qsrr_pipeline.py
 ### 2.4 Outputs (in `OUTDIR/`)
 
 * **Metrics:** `metrics_POS.csv`, `metrics_NEG.csv`, `metrics_POOLED.csv`, `metrics_MACRO.csv`, `metrics_summary.csv`
-* **OOF tables:** `oof_POS.csv`, `oof_NEG.csv`（以及 `oof_POOLED.csv`）
+* **OOF tables:** `oof_POS.csv`, `oof_NEG.csv`（ `oof_POOLED.csv`）
 * **Predictions:** `predicted_rt_theory.csv`, `predicted_rt_inhouse.csv`
 * **Figures**（`figures/`）: parity, `abs_error`, `ecdf`, `williams`, `error_vs_ood` / `error_vs_tanimoto`, boxplots
 * **Diagnostics**（`analysis/`）: `williams_*.csv`, `ad_*_summary_*.csv`
